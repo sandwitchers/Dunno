@@ -7,7 +7,7 @@ A SillyTavern extension that lets you select text in chat messages and quickly e
 1. Select / highlight any text in a chat message.
 2. A floating toolbar with **edit** (pencil) and **delete** (trash) icons appears **below** the selection.
 3. Click **edit** to modify just the selected text, or **delete** to remove it.
-4. The message is updated in place and persisted to the chat.
+4. The message is updated in place and persisted to the chat — the AI will see the edited text on the next turn.
 
 ## Installation
 
@@ -29,32 +29,38 @@ Look for **Quick Edit** in Extensions settings (right panel).
 
 ## Changelog
 
-### v0.2.0
+### v0.3.0
 
-**Bug fixes**
+**Bug fixes (user-reported)**
 
-- **Toolbar now appears below the selection.** Previously it appeared above and collided with Android's native copy/share toolbar. It now defaults to below, flipping above only when there's no room.
-- **Tapping the edit / delete buttons no longer closes the toolbar.** Buttons are now bound to `pointerdown` (with a `mousedown` fallback) instead of `click`, so the action fires before the browser clears the text selection. Previously, on mobile, the `selectionchange` event would wipe the saved range before `click` ran, so the edit popup never opened.
-- **The edit textarea no longer auto-selects all its text.** The caret is now placed at the end of the text, so you can append, re-select, or use `Ctrl+A` yourself. Previously, `.select()` highlighted the entire textarea contents.
-- **Edits are now actually persisted on reload.** The previous version wrote to `context.chat[i].mes_text`, which is not a real property on the SillyTavern chat object — edits appeared in the DOM but were lost on refresh. We now write to `context.chat[i].mes` (the canonical field) and mirror to `mes_text` for third-party compatibility.
-- **Scroll handling now works on inner containers.** Previously `$(document).on("scroll")` missed scrolls on `#chat` and other inner scrollers (scroll events don't bubble). We now use the capture phase so any scroll dismisses the toolbar (unless the edit popup is open).
+- **Toolbar icons are now horizontal, with comfortable spacing.** The root cause was subtle: the CSS declared `gap` and `align-items` on `#qe-toolbar` but never set `display:flex`. When jQuery's `.show()` set an inline `display:block`, the round buttons (each `display:flex` = block-level) stacked vertically. Fixed by toggling visibility with an `.is-visible` class that sets `display:flex !important`, making the buttons `display:inline-flex`, and increasing `gap` from `6px` to `12px`.
+- **Edits now actually reach the AI.** The previous version used `findIndex(m => String(m.mesid) === String(mesId))` to locate the message in `context.chat`. But SillyTavern message objects **do not have a `mesid` field** — the DOM `mesid` attribute is the array index (see ST source: `chat[mesElement.attr('mesid')]`). `findIndex` always returned `-1`, so `saveMessageChanges()` silently bailed, `chat[i].mes` stayed at the old value, the context log showed the old text, and the AI received the old text. Fixed with `parseInt(mesId, 10)` as the array index, with a `findIndex` fallback for forward compatibility.
 
-**UX / accessibility**
+**Forward-thinking safeguards (proactive)**
 
-- Toolbar and popup gain a subtle pop-in animation (disabled under `prefers-reduced-motion`).
-- Buttons gain `type="button"`, `aria-label`, and `role="toolbar"` / `role="dialog"` for screen-reader users.
-- Touch targets enlarged on screens ≤480px.
-- `touch-action: manipulation` and `-webkit-tap-highlight-color: transparent` on all interactive elements to remove the 300ms tap delay and the blue flash.
-- Textarea `font-size: 16px` to prevent iOS auto-zoom on focus.
-- Edit popup clamps to `max-width: calc(100vw - 16px)` so it never overflows on narrow screens.
+- **Swipe sync.** If the edited message has swipes, the current swipe is now also updated (`message.swipes[message.swipe_id] = newHtml`). Without this, switching swipes would silently undo the edit.
+- **Edited badge.** Sets `message.is_edited = true` so SillyTavern shows the standard "edited" indicator on the message.
+- **`updateMessageBlock` call.** After persisting, calls ST's own `context.updateMessageBlock(idx, message)` so the DOM, token cache, and any other extensions that hook into message rendering all see the edit. Wrapped in try/catch so a future ST API change won't break the extension.
+- **HTML escaping.** User-typed text is now HTML-escaped (`<` → `&lt;` etc.) before being inserted into the DOM. Typing `<script>` no longer corrupts the message. Newlines are converted to `<br>` so multi-line edits render as line breaks instead of being collapsed by HTML's default whitespace handling.
+- **Streaming guard.** Refuses to edit a message that is currently being streamed (`message.streaming === true`), with a toastr warning. Editing a streaming message would race with ST's stream writer and silently lose the edit.
+- **Settings migration.** Defaults are now merged with saved values (`{ ...defaults, ...saved }`) instead of only applied when the saved object is empty. Future-added settings will automatically get their default for existing users.
+- **Dynamic dimension measurement.** Toolbar width/height are measured once after creation and cached, so `positionToolbar()` always uses the real size. Previously hardcoded `84×44` which drifted from the actual CSS.
+- **Viewport resize handler.** Hides the toolbar on `resize` because the saved Range's bounding rect becomes stale. Previously the toolbar would float in the wrong spot after rotating the phone or resizing the window.
+- **Defensive index validation.** `resolveMessageIndex()` checks `isNaN`, range bounds, and `null` message objects before touching `chat[idx]`, with detailed console errors for each failure mode.
 
 **Code quality (DX)**
 
-- JSDoc comments on every public function and module-level state variable.
-- Magic numbers (`250`, `500`) extracted into named constants (`SELECTION_DEBOUNCE_MS`, `UI_GRACE_MS`).
-- Replaced `nodeType === 3` magic number with `Node.TEXT_NODE`.
-- New helpers: `bindQuickAction`, `clearSelection`, `onScrollHide`.
-- Safer `stopListening` that also unbinds button and internal pointerdown handlers (previously only `$(document).off(".qe")` ran, leaving button handlers orphaned if the user toggled the extension off then on).
+- Top-of-file design-notes block documenting every root cause and fix rationale — future maintainers don't need to re-derive the analysis.
+- New helpers: `escapeHtml`, `resolveMessageIndex`, `notify`, `onResizeHide`.
+- `notify()` wrapper uses `toastr` when available, falls back to `console.log` so messages are never lost.
+
+### v0.2.0
+
+- Toolbar defaults to below the selection (avoids Android native toolbar collision).
+- Buttons bound to `pointerdown` (was `click`) — fixes "edit icon just closes" on mobile.
+- Removed `.select()` on textarea focus — fixes "selects all the text" bug.
+- Wrote to `context.chat[i].mes` (was `mes_text`).
+- Capture-phase scroll listener for inner scrollers.
 
 ### v0.1.0
 

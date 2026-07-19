@@ -3,28 +3,37 @@
    Visual style: dark glassmorphism, touch-friendly, responsive
    ═══════════════════════════════════════════════════════════ */
 
-/* ── Toolbar ─────────────────────────────────────────────── */
+/* ── Toolbar ───────────────────────────────────────────────
+   IMPORTANT: visibility is toggled with the `.is-visible` class,
+   NOT jQuery `.show()/.hide()`. Using `.show()` sets an inline
+   `display:block` which overrides the `display:flex` below and
+   causes the round buttons (which are themselves `display:flex`
+   = block-level) to stack VERTICALLY. This was the v0.2
+   "ikon vertikal" bug. */
 #qe-toolbar {
     display: none;
     position: fixed;
     z-index: 10000;
-    gap: 6px;
-    padding: 6px 10px;
+    flex-direction: row;          /* explicit: buttons side-by-side */
+    align-items: center;
+    justify-content: center;
+    gap: 12px;                    /* comfortable spacing between icons */
+    padding: 8px 14px;
     background: rgba(30, 30, 30, 0.95);
-    border-radius: 22px;
+    border-radius: 28px;
     box-shadow: 0 2px 14px rgba(0, 0, 0, 0.55);
     border: 1px solid rgba(255, 255, 255, 0.1);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
-    align-items: center;
-    /* Prevent the toolbar itself from being text-selectable, which
-       would otherwise cause weird selection feedback on touch. */
     user-select: none;
     -webkit-user-select: none;
     -webkit-touch-callout: none;
     -webkit-tap-highlight-color: transparent;
-    /* Subtle entrance animation */
     animation: qe-pop-in 0.14s ease-out;
+}
+
+#qe-toolbar.is-visible {
+    display: flex !important;     /* overrides any inline display */
 }
 
 @keyframes qe-pop-in {
@@ -33,23 +42,27 @@
 }
 
 .qe-btn {
-    width: 32px;
-    height: 32px;
+    width: 36px;                  /* comfortable touch target */
+    height: 36px;
     border-radius: 50%;
     border: none;
     background: rgba(255, 255, 255, 0.1);
     color: #e0e0e0;
     cursor: pointer;
-    display: flex;
+    /* `display:inline-flex` (not `flex`) so the buttons themselves
+       stay inline-level inside the toolbar's flex row. Using
+       `display:flex` here would make them block-level and they'd
+       stack vertically even with a flex parent. */
+    display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 13px;
+    font-size: 14px;
     transition: background 0.15s ease, transform 0.1s ease, color 0.15s ease;
     padding: 0;
     line-height: 1;
-    /* Remove the 300ms tap delay on mobile */
     touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
+    flex-shrink: 0;               /* don't shrink inside flex parent */
 }
 
 .qe-btn:hover {
@@ -88,6 +101,10 @@
     animation: qe-pop-in 0.16s ease-out;
 }
 
+#qe-edit-popup.is-visible {
+    display: block !important;
+}
+
 #qe-edit-textarea {
     width: 100%;
     min-height: 80px;
@@ -121,7 +138,7 @@
 
 #qe-cancel-btn,
 #qe-save-btn {
-    padding: 8px 18px;            /* slightly larger for touch targets */
+    padding: 8px 18px;
     border-radius: 6px;
     cursor: pointer;
     font-size: 13px;
@@ -161,12 +178,13 @@
 /* ── Responsive: enlarge touch targets on small screens ─── */
 @media (max-width: 480px) {
     #qe-toolbar {
-        padding: 5px 8px;
+        padding: 6px 10px;
+        gap: 14px;
     }
     .qe-btn {
-        width: 36px;
-        height: 36px;
-        font-size: 14px;
+        width: 40px;
+        height: 40px;
+        font-size: 15px;
     }
     #qe-edit-popup {
         width: calc(100vw - 16px);
@@ -174,7 +192,7 @@
     }
     #qe-cancel-btn,
     #qe-save-btn {
-        padding: 10px 20px;
+        padding: 10px 22px;
         font-size: 14px;
     }
 }

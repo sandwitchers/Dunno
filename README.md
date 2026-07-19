@@ -30,6 +30,29 @@ Look for **Quick Edit** in Extensions settings (right panel).
 
 ## Changelog
 
+### v0.5.1
+
+**Hotfix for v0.5 critical bugs.**
+
+**Critical bug fixes**
+
+- **Rollback now invalidates `savedRange`.** v0.5 added snapshot/restore of `mes`, `mes_text`, `swipes`, and `is_edited` when persistence fails — but forgot that `savedRange` still references the OLD DOM nodes. After `$mesText.html(...)` rollback, `savedRange` pointed to detached nodes. If the user then clicked Save again, `applyRangeEdit(savedRange, ...)` ran against an invalid Range and silently did nothing or corrupted the DOM. v0.5.1 invalidates `savedRange`, clears `currentMesEl`, and hides the toolbar/popup on rollback, so the user is forced to re-select before trying again. The popup no longer stays open with stale state.
+- **Save now restores focus, matching Cancel.** v0.5 only restored focus on Cancel — after Save, focus was left on a detached textarea. v0.5.1 routes both paths through `hideToolbar({ restoreFocus: true })` for consistency.
+
+**Accessibility & UX fixes**
+
+- **`aria-modal="true"` is now honest.** v0.5 left the toolbar visible and clickable behind the popup while the popup declared `aria-modal="true"` — a WCAG violation, since screen readers were told nothing outside the dialog was interactive. v0.5.1 hides the toolbar while the popup is open.
+- **`positionEditPopup` now anchors to the saved Range when the toolbar is hidden.** Previously it required `$toolbar` to be visible; after the `aria-modal` fix above, that precondition broke. The popup now falls back to the selection's bounding rect, then to viewport center.
+- **Escape is now handled in exactly one place.** v0.5 had Escape handlers in both the popup `keydown.qe-internal` listener and the global `keydown.qe` listener — dead-code duplication. v0.5.1 keeps only the global handler; the popup handler now does only Tab focus-trap and Ctrl+Enter save.
+- **Undo toast no longer stacks.** v0.5 fired a fresh toastr on every delete, so rapid deletes piled up notifications. v0.5.1 tracks the last undo toast's clear function and dismisses it before showing a new one; the toast also has a shorter 4s `timeOut` (vs the 5s undo window) so it doesn't sit there taunting the user.
+
+**Code quality (DX)**
+
+- `notify()` now returns a clear function so callers can dismiss the toast programmatically; signature extended with an `overrides` parameter (e.g. `{ timeOut }`).
+- `hideToolbar()` now accepts an options object `{ restoreFocus }` so callers can request focus restoration without going through `hideEditPopup` directly.
+- `clearDeleteUndo()` also dismisses any pending undo toast — no orphan toasts outlive the undo window.
+- Design notes section expanded with points 11 (rollback completeness), 12 (focus consistency), 13 (aria-modal honesty), and 14 (undo UX).
+
 ### v0.5.0
 **Stability & UX upgrades**
 - Selection-to-message mapping is now more defensive, with DOM-order fallback when `mesid` is not enough.

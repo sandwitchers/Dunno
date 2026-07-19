@@ -84,6 +84,35 @@
  *     System events (resize, scroll, selectionchange) NEVER close
  *     the popup. This is enforced by every handler checking
  *     `$editPopup.hasClass("is-visible")` before touching the popup.
+ *
+ * 11. ROLLBACK COMPLETENESS (v0.5.1 hotfix).
+ *     v0.5 added snapshot/restore of `mes`, `mes_text`, `swipes`, and
+ *     `is_edited` when persist fails — but forgot that `savedRange`
+ *     still references the OLD DOM nodes. After `$mesText.html(...)`
+ *     rollback, `savedRange` points to detached nodes. If the user
+ *     then clicks Save again, `applyRangeEdit(savedRange, ...)` runs
+ *     against an invalid Range and silently does nothing (or worse,
+ *     inserts text into a detached subtree).
+ *
+ *     v0.5.1 invalidates `savedRange` and hides the toolbar/popup on
+ *     rollback, so the user is forced to re-select before trying
+ *     again. The popup also does NOT stay open with stale state.
+ *
+ * 12. FOCUS CONSISTENCY (v0.5.1 hotfix).
+ *     v0.5 only restored focus on Cancel — not on Save. After Save,
+ *     focus was lost (left on a detached textarea). v0.5.1 restores
+ *     focus on BOTH paths consistently.
+ *
+ * 13. ARIA-MODAL HONESTY (v0.5.1 hotfix).
+ *     `aria-modal="true"` promises screen readers that nothing
+ *     outside the dialog is interactive. v0.5 left the toolbar
+ *     visible and clickable behind the popup — an a11y violation.
+ *     v0.5.1 hides the toolbar while the popup is open.
+ *
+ * 14. UNDO UX (v0.5.1 hotfix).
+ *     v0.5 fired a toastr on every delete, which stacks up when the
+ *     user deletes repeatedly. v0.5.1 uses a single ephemeral toast
+ *     with a shorter message and replaces any previous one.
  */
 
 import { extension_settings, getContext } from "../../../extensions.js";
@@ -120,10 +149,17 @@ let previousFocusElement = null;
 let lastDeletedSnapshot = null;
 /** timeout handle for delete undo expiration */
 let lastDeleteUndoTimer = null;
+/** clear function for the last undo toast, so we can dismiss it
+ *  before showing a new one (prevents toast stacking on rapid
+ *  deletes). */
+let lastUndoToastClear = null;
 
 const UI_GRACE_MS = 500;
 const SELECTION_DEBOUNCE_MS = 250;
 const DELETE_UNDO_MS = 5000;
+/** shorter undo toast timeout — toast clears before the undo window
+ *  expires so it doesn't sit there taunting the user. */
+const UNDO_TOAST_MS = 4000;
 
 /* =============================================================
    SETTINGS
@@ -191,6 +227,9 @@ function createUI() {
 
     bindQuickAction($("#qe-edit-btn"), onEditClick);
     bindQuickAction($("#qe-delete-btn"), onDeleteClick);
+    // Cancel and Save both restore focus to the previously-focused
+    // element. v0.5 only restored on Cancel — v0.5.1 makes both
+    // paths consistent.
     bindQuickAction($("#qe-cancel-btn"), () => hideEditPopup({ restoreFocus: true }));
     bindQuickAction($("#qe-save-btn"), onEditSave);
 
@@ -198,10 +237,14 @@ function createUI() {
         lastUiInteraction = Date.now();
     });
 
+    // Popup keydown: only handle Tab (focus trap) and Ctrl+Enter
+    // (save). Escape is handled ONCE in the global `keydown.qe`
+    // handler in startListening() — having two Escape handlers
+    // (popup + global) was dead-code duplication in v0.5.
     $editPopup.on("keydown.qe-internal", function (e) {
-        if (e.key === "Escape") {
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
             e.preventDefault();
-            hideEditPopup({ restoreFocus: true });
+            onEditSave();
             return;
         }
 
@@ -219,17 +262,6 @@ function createUI() {
 
         e.preventDefault();
         focusables.eq(nextIndex).trigger("focus");
-    });
-
-    $("#qe-edit-textarea").on("keydown", function (e) {
-        if (e.key === "Escape") {
-            e.preventDefault();
-            hideEditPopup({ restoreFocus: true });
-        }
-        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-            e.preventDefault();
-            onEditSave();
-        }
     });
 }
 
@@ -362,9 +394,15 @@ function positionToolbar(range) {
     $toolbar.css({ top: `${top}px`, left: `${left}px` });
 }
 
-function hideToolbar() {
+/**
+ * Hide the toolbar (and popup). Accepts an options object so callers
+ * can request focus restoration — used by onEditSave to match
+ * Cancel's behavior. Default is no focus restore for backward
+ * compatibility with system-event callers (scroll/resize/mousedown).
+ */
+function hideToolbar({ restoreFocus = false } = {}) {
     if ($toolbar) $toolbar.removeClass("is-visible");
-    hideEditPopup({ restoreFocus: false });
+    hideEditPopup({ restoreFocus });
     savedRange = null;
     currentMesEl = null;
 }
@@ -423,6 +461,12 @@ function clearDeleteUndo() {
         lastDeleteUndoTimer = null;
     }
     lastDeletedSnapshot = null;
+    // Clear any pending undo toast so it doesn't outlive the undo
+    // window and confuse the user.
+    if (lastUndoToastClear) {
+        try { lastUndoToastClear(); } catch (_) { /* ignore */ }
+        lastUndoToastClear = null;
+    }
 }
 
 function registerDeleteUndo(idx, snapshot) {
@@ -436,7 +480,13 @@ function registerDeleteUndo(idx, snapshot) {
         clearDeleteUndo();
     }, DELETE_UNDO_MS);
 
-    notify(`Deleted. Press Ctrl+Z within ${DELETE_UNDO_MS / 1000} seconds to undo.`, "info");
+    // Single ephemeral toast — clears any prior undo toast first so
+    // rapid deletes don't stack up a wall of notifications.
+    lastUndoToastClear = notify(
+        `Deleted. Ctrl+Z to undo (${DELETE_UNDO_MS / 1000}s).`,
+        "info",
+        { timeOut: UNDO_TOAST_MS }
+    );
 }
 
 function undoLastDelete() {
@@ -665,11 +715,20 @@ function onEditClick() {
 
     clearDeleteUndo();
 
+    // Capture focus BEFORE opening the popup so we can restore it on
+    // both Save and Cancel paths (v0.5.1 consistency fix).
     previousFocusElement = document.activeElement;
+
     const $textarea = $("#qe-edit-textarea");
     $textarea.val(savedRange.toString());
 
     positionEditPopup();
+
+    // ARIA honesty: hide the toolbar while the popup is open.
+    // `aria-modal="true"` on the popup promises screen readers that
+    // nothing else is interactive; leaving the toolbar visible was
+    // a WCAG violation in v0.5.
+    if ($toolbar) $toolbar.removeClass("is-visible");
 
     const ta = $textarea[0];
     ta.focus();
@@ -693,10 +752,26 @@ function onEditSave() {
     }
 
     if (!saveMessageChanges({ previousState, action: "edit" })) {
+        // Persist failed and was rolled back. The DOM has been
+        // restored to its pre-edit state, which means `savedRange`
+        // now references DETACHED nodes (the rollback did
+        // `$mesText.html(...)` which replaces all children).
+        //
+        // We MUST invalidate savedRange and close the popup —
+        // otherwise the next Save click would run applyRangeEdit
+        // against a Range pointing into a detached subtree, which
+        // silently does nothing or corrupts the DOM. v0.5 left the
+        // popup open here, which was a critical stuck-state bug.
+        savedRange = null;
+        currentMesEl = null;
+        hideToolbar();
+        clearSelection();
         return;
     }
 
-    hideToolbar();
+    // Save succeeded — restore focus to the previously-focused
+    // element (the chat, usually) for parity with Cancel.
+    hideToolbar({ restoreFocus: true });
     clearSelection();
 }
 
@@ -715,6 +790,12 @@ function onDeleteClick() {
     }
 
     if (!saveMessageChanges({ previousState, action: "delete" })) {
+        // Same rollback rationale as onEditSave: savedRange is now
+        // pointing into detached DOM, must invalidate.
+        savedRange = null;
+        currentMesEl = null;
+        hideToolbar();
+        clearSelection();
         return;
     }
 
@@ -747,8 +828,7 @@ function clearSelection() {
    ============================================================= */
 
 function positionEditPopup() {
-    if (!$toolbar || !$editPopup) return;
-    const tbRect = $toolbar[0].getBoundingClientRect();
+    if (!$editPopup) return;
     const vp = getViewportMetrics();
     const gap = 8;
 
@@ -757,10 +837,30 @@ function positionEditPopup() {
     const popW = $editPopup.outerWidth() || 320;
     const popH = $editPopup.outerHeight() || 180;
 
-    let top = vp.top + tbRect.bottom + gap;
-    let left = vp.left + tbRect.left;
+    // The toolbar may have been hidden (aria-modal honesty in
+    // onEditClick). Use its last-known rect if available, otherwise
+    // anchor the popup to the selection's vertical center.
+    let anchorTop, anchorLeft, anchorBottom;
+    if ($toolbar && $toolbar.hasClass("is-visible")) {
+        const tbRect = $toolbar[0].getBoundingClientRect();
+        anchorTop = tbRect.top;
+        anchorBottom = tbRect.bottom;
+        anchorLeft = tbRect.left;
+    } else if (savedRange) {
+        const r = savedRange.getBoundingClientRect();
+        anchorTop = r.top;
+        anchorBottom = r.bottom;
+        anchorLeft = r.left + (r.width / 2) - (popW / 2);
+    } else {
+        anchorTop = vp.top + (vp.height / 2) - (popH / 2);
+        anchorBottom = anchorTop;
+        anchorLeft = vp.left + (vp.width / 2) - (popW / 2);
+    }
 
-    if (top + popH > vp.top + vp.height - 4) top = vp.top + tbRect.top - popH - gap;
+    let top = vp.top + anchorBottom + gap;
+    let left = vp.left + anchorLeft;
+
+    if (top + popH > vp.top + vp.height - 4) top = vp.top + anchorTop - popH - gap;
     if (top < vp.top + 4) top = vp.top + 4;
     if (left + popW > vp.left + vp.width - 4) left = vp.left + vp.width - popW - 4;
     if (left < vp.left + 4) left = vp.left + 4;
@@ -802,16 +902,35 @@ function restorePreviousFocus() {
    UTILITIES
    ============================================================= */
 
-function notify(message, type = "info") {
+/**
+ * Show a toastr notification if toastr is available (SillyTavern
+ * always loads it). Falls back to console.log so the message is
+ * never lost.
+ *
+ * @param {string} message - text to show
+ * @param {string} [type="info"] - toastr method name (info/success/warning/error)
+ * @param {object} [overrides] - extra toastr options (e.g. {timeOut})
+ * @returns {function|null} a clear function (to dismiss the toast
+ *   programmatically) when toastr is available; otherwise null.
+ */
+function notify(message, type = "info", overrides = {}) {
     try {
         if (typeof toastr !== "undefined" && typeof toastr[type] === "function") {
-            toastr[type](message);
-            return;
+            const toast = toastr[type](message, "", overrides);
+            // toastr returns a jQuery-wrapped toast element; expose a
+            // clear helper so callers can dismiss it before timeout.
+            if (toast && typeof toastr.clear === "function") {
+                return () => {
+                    try { toastr.clear(toast); } catch (_) { /* ignore */ }
+                };
+            }
+            return null;
         }
     } catch (e) {
         // fall through
     }
     console.log(`[${extensionName}] ${type}: ${message}`);
+    return null;
 }
 
 /* =============================================================

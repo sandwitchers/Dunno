@@ -1,1 +1,132 @@
-/* Quick Edit - Stage 1: Empty for now */
+/* ═══════════════════════════════════════════════════════════
+   Quick Edit — Floating Toolbar & Edit Popup
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── Toolbar ─────────────────────────────────────────────── */
+#qe-toolbar {
+    display: none;
+    position: fixed;
+    z-index: 10000;
+    gap: 6px;
+    padding: 6px 10px;
+    background: rgba(30, 30, 30, 0.95);
+    border-radius: 22px;
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    align-items: center;
+}
+
+.qe-btn {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255, 255, 255, 0.1);
+    color: #e0e0e0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    transition: background 0.15s ease, transform 0.1s ease;
+    padding: 0;
+    line-height: 1;
+}
+
+.qe-btn:hover {
+    background: rgba(255, 255, 255, 0.2);
+    transform: scale(1.12);
+}
+
+.qe-btn:active {
+    transform: scale(0.93);
+}
+
+#qe-edit-btn:hover {
+    color: #7eb8f7;
+}
+
+#qe-delete-btn:hover {
+    color: #f77b7b;
+}
+
+/* ── Edit Popup ──────────────────────────────────────────── */
+#qe-edit-popup {
+    display: none;
+    position: fixed;
+    z-index: 10001;
+    width: 320px;
+    padding: 14px;
+    background: rgba(22, 22, 28, 0.98);
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    box-sizing: border-box;
+}
+
+#qe-edit-textarea {
+    width: 100%;
+    min-height: 80px;
+    max-height: 200px;
+    resize: vertical;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    color: #e0e0e0;
+    padding: 10px;
+    font-size: 14px;
+    font-family: inherit;
+    line-height: 1.5;
+    box-sizing: border-box;
+    margin: 0;
+}
+
+#qe-edit-textarea:focus {
+    outline: none;
+    border-color: rgba(126, 184, 247, 0.5);
+}
+
+#qe-popup-buttons {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+    justify-content: flex-end;
+}
+
+#qe-cancel-btn {
+    padding: 6px 16px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    background: transparent;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 13px;
+    font-family: inherit;
+    transition: background 0.15s ease;
+}
+
+#qe-cancel-btn:hover {
+    background: rgba(255, 255, 255, 0.05);
+    color: #ddd;
+}
+
+#qe-save-btn {
+    padding: 6px 16px;
+    border-radius: 6px;
+    border: none;
+    background: #4a6fa5;
+    color: white;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    font-family: inherit;
+    transition: background 0.15s ease;
+}
+
+#qe-save-btn:hover {
+    background: #5a7fb5;
+}

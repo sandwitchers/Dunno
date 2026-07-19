@@ -71,6 +71,25 @@
  *     (`{ ...defaults, ...saved }`) instead of only applied when the
  *     saved object is empty. This means we can add new settings in
  *     the future without breaking existing users.
+ *
+ *  9. VIEWPORT CHANGES (KEYBOARD) — CRITICAL FIX in v0.4.
+ *     On mobile, the soft keyboard appearing fires `resize` AND
+ *     `visualViewport.resize` events. v0.3's `onResizeHide` closed
+ *     the popup on these events, which meant every attempt to type
+ *     in the edit textarea was immediately killed by the keyboard
+ *     appearing — the most frustrating bug in the extension.
+ *
+ *     v0.4 NEVER closes the popup on viewport changes. It only
+ *     repositions the popup if it's off-screen, using
+ *     `visualViewport` for keyboard-aware positioning. The toolbar
+ *     (without popup) is still hidden on resize because its saved
+ *     Range rect is stale.
+ *
+ * 10. POPUP INVARIANCE — the edit popup is only closed by explicit
+ *     user actions: Save, Cancel, Escape, or clicking outside.
+ *     System events (resize, scroll, selectionchange) NEVER close
+ *     the popup. This is enforced by every handler checking
+ *     `$editPopup.hasClass("is-visible")` before touching the popup.
  */
 
 import { extension_settings, getContext } from "../../../extensions.js";
@@ -92,10 +111,12 @@ let $editPopup = null;
 let savedRange = null;
 /** @type {jQuery|null} the .mes element that owns the selection */
 let currentMesEl = null;
-/** debounce handle for the `selectionchange` listener */
-let selectionTimer = null;
 /** timestamp (ms) of the last pointerdown on toolbar / popup */
 let lastUiInteraction = 0;
+/** debounce handle for the `selectionchange` listener */
+let selectionTimer = null;
+/** debounce handle for viewport (resize / visualViewport) events */
+let resizeTimer = null;
 /** cached toolbar outer dimensions (measured once in createUI) */
 let toolbarWidth = 110;
 let toolbarHeight = 52;
@@ -624,14 +645,69 @@ function onScrollHide() {
 }
 
 /**
- * Resize handler — hide the toolbar on viewport resize. The saved
- * Range's bounding rect is stale after a resize, so repositioning
- * would put the toolbar in the wrong spot.
+ * Viewport change handler — fires on `window.resize` AND
+ * `visualViewport.resize` (the latter fires when the mobile keyboard
+ * appears/disappears).
+ *
+ * CRITICAL: If the edit popup is open, we DO NOT close it. On mobile,
+ * the keyboard appearing triggers this handler, and closing the popup
+ * mid-edit is the most frustrating bug. We only reposition the popup
+ * if it's now off-screen.
+ *
+ * If only the toolbar is open (no popup), we hide it because the
+ * saved Range's bounding rect is stale after a viewport change.
+ *
+ * The handler is debounced (150ms) because resize/visualViewport
+ * events fire many times during a keyboard appear animation.
  */
-function onResizeHide() {
-    if ($toolbar && $toolbar.hasClass("is-visible")) {
-        hideToolbar();
+function onViewportChange() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+        // If the popup is open, the user is editing. NEVER close it.
+        // Just reposition if off-screen (keyboard may have shrunk viewport).
+        if ($editPopup && $editPopup.hasClass("is-visible")) {
+            repositionPopupForViewport();
+            return;
+        }
+        // Otherwise, hide the toolbar (saved Range rect is stale).
+        if ($toolbar && $toolbar.hasClass("is-visible")) {
+            hideToolbar();
+        }
+    }, 150);
+}
+
+/**
+ * Reposition the edit popup if it's off-screen after a viewport
+ * change (e.g. mobile keyboard appearing). Uses `visualViewport`
+ * when available for accurate keyboard-aware positioning.
+ *
+ * If the popup is already fully visible, this is a no-op (avoids jank).
+ */
+function repositionPopupForViewport() {
+    if (!$editPopup || !$editPopup.hasClass("is-visible")) return;
+
+    // Use visualViewport if available — it accounts for the mobile
+    // keyboard, unlike window.innerHeight.
+    const vv = window.visualViewport;
+    const vh = vv ? vv.height : window.innerHeight;
+    const vw = vv ? vv.width : window.innerWidth;
+
+    const rect = $editPopup[0].getBoundingClientRect();
+
+    // If popup is fully visible, don't move it (avoids jank).
+    if (rect.top >= 4 && rect.bottom <= vh - 4 &&
+        rect.left >= 4 && rect.right <= vw - 4) {
+        return;
     }
+
+    // Center it in the visible area.
+    const popW = $editPopup.outerWidth() || 320;
+    const popH = $editPopup.outerHeight() || 180;
+
+    let top = Math.max(4, (vh - popH) / 2);
+    let left = Math.max(4, (vw - popW) / 2);
+
+    $editPopup.css({ top: `${top}px`, left: `${left}px` });
 }
 
 function startListening() {
@@ -660,8 +736,13 @@ function startListening() {
     // containers (e.g. #chat) which don't bubble to document.
     window.addEventListener("scroll", onScrollHide, true);
 
-    // Resize → hide (stale Range rect).
-    window.addEventListener("resize", onResizeHide);
+    // Viewport changes (resize / keyboard) — see onViewportChange.
+    // CRITICAL: must NOT close the popup on these events, because
+    // on mobile the keyboard appearing fires resize.
+    window.addEventListener("resize", onViewportChange);
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", onViewportChange);
+    }
 }
 
 function stopListening() {
@@ -670,9 +751,13 @@ function stopListening() {
     $toolbar && $toolbar.off(".qe-internal");
     $editPopup && $editPopup.off(".qe-internal");
     window.removeEventListener("scroll", onScrollHide, true);
-    window.removeEventListener("resize", onResizeHide);
+    window.removeEventListener("resize", onViewportChange);
+    if (window.visualViewport) {
+        window.visualViewport.removeEventListener("resize", onViewportChange);
+    }
     document.removeEventListener("selectionchange", onSelectionChangeHandler);
     clearTimeout(selectionTimer);
+    clearTimeout(resizeTimer);
     hideToolbar();
 }
 

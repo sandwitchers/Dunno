@@ -29,6 +29,26 @@ Look for **Quick Edit** in Extensions settings (right panel).
 
 ## Changelog
 
+### v0.4.0
+
+**Bug fixes (user-reported)**
+
+- **Edit popup no longer closes when you try to type in the textarea.** This was the most frustrating bug. Root cause: v0.3's `onResizeHide` handler — added as a "forward-thinking safeguard" — closed the toolbar (and popup) on every `resize` event. On Android, the soft keyboard appearing fires `resize`, so the moment the textarea got focus and the keyboard slid up, the popup was killed. Fixed by replacing `onResizeHide` with `onViewportChange`, which NEVER closes the popup on viewport changes — it only repositions the popup if it's off-screen (using `visualViewport` for keyboard-aware positioning). The toolbar-only case still hides on resize (saved Range rect is stale).
+
+**Forward-thinking safeguards (proactive)**
+
+- **`visualViewport` API.** Listens to `visualViewport.resize` in addition to `window.resize`. `visualViewport.height` accurately reflects the visible area after the keyboard appears, unlike `window.innerHeight` which may not change on all Android versions. This means popup repositioning is accurate even when the keyboard shrinks the visible area by 50%.
+- **Debounced viewport handler (150ms).** Resize/visualViewport events fire many times during the keyboard appear/disappear animation. The debounce ensures we only act once, after the animation settles.
+- **Popup invariance principle.** Documented and enforced: the edit popup is ONLY closed by explicit user actions (Save, Cancel, Escape, click outside). System events (resize, scroll, selectionchange) NEVER close the popup. Every handler that could close the popup is audited and guarded with `$editPopup.hasClass("is-visible")` checks.
+- **Reposition-only-when-off-screen.** `repositionPopupForViewport()` is a no-op if the popup is already fully visible, avoiding visual jank during keyboard animations.
+- **Complete handler audit.** All 8 call sites of `hideToolbar()` and `hideEditPopup()` verified to be either (a) explicit user actions, (b) guarded by popup-visibility checks, or (c) extension teardown.
+
+**Code quality (DX)**
+
+- Design notes section expanded with points 9 (viewport/keyboard) and 10 (popup invariance principle).
+- New helpers: `onViewportChange`, `repositionPopupForViewport`.
+- `resizeTimer` state variable added; cleared in `stopListening()` to prevent orphaned timeouts.
+
 ### v0.3.0
 
 **Bug fixes (user-reported)**

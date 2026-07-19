@@ -1,3 +1,37 @@
+/**
+ * Quick Edit — SillyTavern third-party extension
+ *
+ * Lets the user select any portion of a chat message and edit / delete
+ * just that portion via a floating toolbar, without opening SillyTavern's
+ * full-message editor.
+ *
+ * ── Design notes (post-revamp) ─────────────────────────────────
+ *  1. The floating toolbar defaults to BELOW the selection. This is
+ *     deliberate: Android's native text-action toolbar always appears
+ *     ABOVE the selection, so an above-ours would collide with it.
+ *     We only flip above when there is no room below.
+ *
+ *  2. Buttons are bound to `pointerdown` (with a `mousedown` fallback)
+ *     rather than `click`. On touch devices, `click` is delayed long
+ *     enough for `selectionchange` to fire and wipe the saved range
+ *     before the click handler runs — which is why tapping the edit
+ *     icon used to "just close" the toolbar.
+ *
+ *  3. The saved selection (`savedRange`) is preserved across focus
+ *     shifts. We track `lastUiInteraction` and ignore transient
+ *     `selectionchange` events that fire within a short grace window
+ *     after a toolbar / popup interaction.
+ *
+ *  4. The edit popup's textarea is focused WITHOUT calling `.select()`
+ *     so the user can place the caret freely; previously `.select()`
+ *     selected all the text in the textarea, which the user reported
+ *     as "selecting all the text".
+ *
+ *  5. Edits are persisted to `context.chat[idx].mes` (the real
+ *     SillyTavern field). The previous version wrote to `mes_text`,
+ *     which is not a real property — edits were lost on reload.
+ */
+
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, saveChatDebounced } from "../../../../script.js";
 
@@ -8,12 +42,24 @@ const defaultSettings = {
     enabled: true
 };
 
-// ── State ──────────────────────────────────────────────────
+// ── Internal state ──────────────────────────────────────────
+/** @type {jQuery|null} floating toolbar element */
 let $toolbar = null;
+/** @type {jQuery|null} edit popup element */
 let $editPopup = null;
+/** @type {Range|null} snapshot of the user's last text selection */
 let savedRange = null;
+/** @type {jQuery|null} the .mes element that owns the selection */
 let currentMesEl = null;
+/** debounce handle for the `selectionchange` listener */
 let selectionTimer = null;
+/** timestamp (ms) of the last pointerdown on toolbar / popup */
+let lastUiInteraction = 0;
+/** ignore transient selectionchange events for this long after a
+ *  toolbar / popup interaction (ms). */
+const UI_GRACE_MS = 500;
+/** selectionchange debounce delay (ms). */
+const SELECTION_DEBOUNCE_MS = 250;
 
 /* =============================================================
    SETTINGS
@@ -48,36 +94,86 @@ function createUI() {
     if ($("#qe-toolbar").length) return; // prevent duplicates
 
     $toolbar = $(`
-        <div id="qe-toolbar">
-            <button id="qe-edit-btn" class="qe-btn" title="Edit selected text">
+        <div id="qe-toolbar" role="toolbar" aria-label="Quick edit toolbar">
+            <button id="qe-edit-btn" class="qe-btn" type="button"
+                    title="Edit selected text" aria-label="Edit selected text">
                 <i class="fa-solid fa-pen"></i>
             </button>
-            <button id="qe-delete-btn" class="qe-btn" title="Delete selected text">
+            <button id="qe-delete-btn" class="qe-btn" type="button"
+                    title="Delete selected text" aria-label="Delete selected text">
                 <i class="fa-solid fa-trash"></i>
             </button>
         </div>
     `);
 
     $editPopup = $(`
-        <div id="qe-edit-popup">
-            <textarea id="qe-edit-textarea" placeholder="Edit selected text..."></textarea>
+        <div id="qe-edit-popup" role="dialog" aria-label="Edit selected text">
+            <textarea id="qe-edit-textarea"
+                      placeholder="Edit selected text..."></textarea>
             <div id="qe-popup-buttons">
-                <button id="qe-cancel-btn">Cancel</button>
-                <button id="qe-save-btn">Save</button>
+                <button id="qe-cancel-btn" type="button">Cancel</button>
+                <button id="qe-save-btn" type="button">Save</button>
             </div>
         </div>
     `);
 
-    $("body").append($toolbar);
-    $("body").append($editPopup);
+    $("body").append($toolbar).append($editPopup);
 
-    $("#qe-edit-btn").on("click", onEditClick);
-    $("#qe-delete-btn").on("click", onDeleteClick);
-    $("#qe-cancel-btn").on("click", hideEditPopup);
-    $("#qe-save-btn").on("click", onEditSave);
+    // Bind button actions to `pointerdown` so they fire BEFORE the
+    // browser clears the text selection on touch devices. This is the
+    // fix for "the edit icon just closes when I tap it".
+    bindQuickAction($("#qe-edit-btn"), onEditClick);
+    bindQuickAction($("#qe-delete-btn"), onDeleteClick);
+    bindQuickAction($("#qe-cancel-btn"), hideEditPopup);
+    bindQuickAction($("#qe-save-btn"), onEditSave);
+
+    // Track any pointerdown on the toolbar / popup so we can ignore
+    // transient `selectionchange` events that follow.
+    $toolbar.add($editPopup).on("pointerdown.qe-internal mousedown.qe-internal", () => {
+        lastUiInteraction = Date.now();
+    });
+
     $("#qe-edit-textarea").on("keydown", function (e) {
-        if (e.key === "Escape") hideEditPopup();
-        if (e.key === "Enter" && e.ctrlKey) onEditSave();
+        if (e.key === "Escape") {
+            e.preventDefault();
+            hideEditPopup();
+        }
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault();
+            onEditSave();
+        }
+    });
+}
+
+/**
+ * Bind a handler that fires on `pointerdown` (preferred) or
+ * `mousedown` (fallback). Calling `e.preventDefault()` on these
+ * early events prevents the browser from shifting focus away from
+ * the page selection, which is what wiped `savedRange` before
+ * `click` could run on mobile.
+ *
+ * The follow-up `click` is suppressed so the handler doesn't run
+ * twice.
+ */
+function bindQuickAction($el, handler) {
+    const startEvent = window.PointerEvent ? "pointerdown" : "mousedown";
+    let handled = false;
+
+    $el.on(startEvent + ".qe-btn", function (e) {
+        // Only react to the primary button (left click / touch / pen).
+        if (e.button && e.button !== 0) return;
+        e.preventDefault();            // prevent focus shift / selection clearing
+        handled = true;
+        lastUiInteraction = Date.now();
+        handler.call(this, e);
+        setTimeout(() => { handled = false; }, 500);
+    });
+
+    $el.on("click.qe-btn", function (e) {
+        if (handled) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+        }
     });
 }
 
@@ -90,7 +186,18 @@ function handleSelection() {
     if ($editPopup && $editPopup.is(":visible")) return; // don't hide while editing
 
     const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.toString().trim().length === 0) {
+    const hasSelection = !!sel && !sel.isCollapsed && sel.toString().trim().length > 0;
+
+    // If the user just tapped a toolbar / popup button, the browser
+    // may briefly clear the selection (focus shift). Ignore those
+    // transient events so we don't lose `savedRange` — BUT only when
+    // there is no fresh selection. A new selection should always be
+    // honoured, even within the grace window.
+    if (!hasSelection && Date.now() - lastUiInteraction < UI_GRACE_MS) {
+        return;
+    }
+
+    if (!hasSelection) {
         hideToolbar();
         return;
     }
@@ -98,7 +205,9 @@ function handleSelection() {
     const anchorNode = sel.anchorNode;
     if (!anchorNode) { hideToolbar(); return; }
 
-    const anchorEl = anchorNode.nodeType === 3 ? anchorNode.parentElement : anchorNode;
+    const anchorEl = anchorNode.nodeType === Node.TEXT_NODE
+        ? anchorNode.parentElement
+        : anchorNode;
     if (!anchorEl) { hideToolbar(); return; }
 
     // Must be inside #chat .mes_text
@@ -111,7 +220,9 @@ function handleSelection() {
 
     const focusNode = sel.focusNode;
     if (focusNode) {
-        const focusEl = focusNode.nodeType === 3 ? focusNode.parentElement : focusNode;
+        const focusEl = focusNode.nodeType === Node.TEXT_NODE
+            ? focusNode.parentElement
+            : focusNode;
         const focusMes = focusEl ? $(focusEl).closest(".mes") : $();
         if (focusMes.length && anchorMes.attr("mesid") !== focusMes.attr("mesid")) {
             hideToolbar();
@@ -132,18 +243,31 @@ function handleSelection() {
     $toolbar.show();
 }
 
+/**
+ * Position the floating toolbar relative to a Range.
+ *
+ * Default: BELOW the selection (so it doesn't collide with Android's
+ * native text-action toolbar, which always appears above). Flips above
+ * only when there's no room below, then clamps to the viewport.
+ */
 function positionToolbar(range) {
     const rect = range.getBoundingClientRect();
     const tbW = 84;
     const tbH = 44;
     const gap = 8;
 
-    let top = rect.top - tbH - gap;
+    // Default: BELOW the selection
+    let top = rect.bottom + gap;
     let left = rect.left + (rect.width / 2) - (tbW / 2);
 
-    // Flip below if not enough space above
-    if (top < 4) top = rect.bottom + gap;
-    // Horizontal clamp
+    // Flip above only if there's no room below
+    if (top + tbH > window.innerHeight - 4) {
+        top = rect.top - tbH - gap;
+    }
+    // Final clamp to viewport
+    if (top < 4) top = 4;
+    if (top + tbH > window.innerHeight - 4) top = window.innerHeight - tbH - 4;
+
     if (left < 4) left = 4;
     if (left + tbW > window.innerWidth - 4) left = window.innerWidth - tbW - 4;
 
@@ -163,10 +287,21 @@ function hideToolbar() {
 
 function onEditClick() {
     if (!savedRange) return;
-    $("#qe-edit-textarea").val(savedRange.toString());
+
+    const $textarea = $("#qe-edit-textarea");
+    $textarea.val(savedRange.toString());
+
     positionEditPopup();
     $editPopup.show();
-    $("#qe-edit-textarea").focus().select();
+
+    // Focus WITHOUT `.select()` — `.select()` highlighted the entire
+    // textarea contents, which the user reported as "it selects all
+    // the text". Instead, place the caret at the end so the user can
+    // append, re-select, or use Ctrl+A themselves.
+    const ta = $textarea[0];
+    ta.focus();
+    const len = ta.value.length;
+    ta.setSelectionRange(len, len);
 }
 
 function onEditSave() {
@@ -176,7 +311,7 @@ function onEditSave() {
     applyRangeEdit(savedRange, newText);
     saveMessageChanges();
     hideToolbar();
-    window.getSelection().removeAllRanges();
+    clearSelection();
 }
 
 function onDeleteClick() {
@@ -185,12 +320,17 @@ function onDeleteClick() {
     applyRangeEdit(savedRange, "");
     saveMessageChanges();
     hideToolbar();
-    window.getSelection().removeAllRanges();
+    clearSelection();
+}
+
+function clearSelection() {
+    const sel = window.getSelection();
+    if (sel) sel.removeAllRanges();
 }
 
 /**
- * Replace content inside a Range with new text (or empty string to delete).
- * Handles cross-node selections natively via Range API.
+ * Replace the contents of a Range with new text (or "" to delete).
+ * Handles cross-node selections natively via the Range API.
  */
 function applyRangeEdit(range, newText) {
     const sel = window.getSelection();
@@ -203,13 +343,14 @@ function applyRangeEdit(range, newText) {
     }
 
     // Merge adjacent text nodes so innerHTML stays clean
-    if (range.commonAncestorContainer && typeof range.commonAncestorContainer.normalize === "function") {
-        range.commonAncestorContainer.normalize();
+    const common = range.commonAncestorContainer;
+    if (common && typeof common.normalize === "function") {
+        common.normalize();
     }
 }
 
 /* =============================================================
-   SAVE TO SILLYTAVERN CHAT DATA
+   PERSIST TO SILLYTAVERN CHAT DATA
    ============================================================= */
 
 function saveMessageChanges() {
@@ -239,13 +380,24 @@ function saveMessageChanges() {
         return;
     }
 
-    context.chat[idx].mes_text = $mesText.html();
+    const newHtml = $mesText.html();
+
+    // SillyTavern stores the message body in `mes` (HTML).
+    // The previous version wrote only to `mes_text`, which is not a
+    // real property on the chat object — edits appeared in the DOM
+    // but were lost on reload. We now write to `mes` and also mirror
+    // to `mes_text` for any third-party code that may read it.
+    context.chat[idx].mes = newHtml;
+    context.chat[idx].mes_text = newHtml;
 
     if (typeof saveChatDebounced === "function") {
         saveChatDebounced();
         console.log(`[${extensionName}] Message ${idx} updated & saved`);
     } else {
-        console.warn(`[${extensionName}] saveChatDebounced not available — edit applied to DOM but NOT persisted to disk`);
+        console.warn(
+            `[${extensionName}] saveChatDebounced not available — ` +
+            `edit applied to DOM but NOT persisted to disk`
+        );
     }
 }
 
@@ -264,6 +416,7 @@ function positionEditPopup() {
     let left = tbRect.left;
 
     if (top + popH > window.innerHeight - 4) top = tbRect.top - popH - gap;
+    if (top < 4) top = 4;
     if (left + popW > window.innerWidth - 4) left = window.innerWidth - popW - 4;
     if (left < 4) left = 4;
 
@@ -280,7 +433,17 @@ function hideEditPopup() {
 
 function onSelectionChangeHandler() {
     clearTimeout(selectionTimer);
-    selectionTimer = setTimeout(handleSelection, 250);
+    selectionTimer = setTimeout(handleSelection, SELECTION_DEBOUNCE_MS);
+}
+
+/**
+ * Scroll handler — hides the toolbar when the page scrolls, unless
+ * the edit popup is open (in which case we don't disrupt editing).
+ */
+function onScrollHide() {
+    if ($toolbar && $toolbar.is(":visible") && $editPopup && !$editPopup.is(":visible")) {
+        hideToolbar();
+    }
 }
 
 function startListening() {
@@ -293,7 +456,7 @@ function startListening() {
     // Mobile / keyboard / accessibility: selectionchange (debounced)
     document.addEventListener("selectionchange", onSelectionChangeHandler);
 
-    // Click outside toolbar/popup/chat → dismiss
+    // Click outside toolbar / popup / chat → dismiss
     $(document).on("mousedown.qe", function (e) {
         if (!$(e.target).closest("#qe-toolbar, #qe-edit-popup, #chat .mes_text").length) {
             hideToolbar();
@@ -305,16 +468,17 @@ function startListening() {
         if (e.key === "Escape") hideToolbar();
     });
 
-    // Scroll → reposition or hide
-    $(document).on("scroll.qe", function () {
-        if ($toolbar && $toolbar.is(":visible") && !$editPopup.is(":visible")) {
-            hideToolbar();
-        }
-    });
+    // Scroll → hide. Use capture phase so we catch scrolls on inner
+    // containers (e.g. #chat) which don't bubble to document.
+    window.addEventListener("scroll", onScrollHide, true);
 }
 
 function stopListening() {
     $(document).off(".qe");
+    $("#qe-edit-btn, #qe-delete-btn, #qe-cancel-btn, #qe-save-btn").off(".qe-btn");
+    $toolbar && $toolbar.off(".qe-internal");
+    $editPopup && $editPopup.off(".qe-internal");
+    window.removeEventListener("scroll", onScrollHide, true);
     document.removeEventListener("selectionchange", onSelectionChangeHandler);
     clearTimeout(selectionTimer);
     hideToolbar();

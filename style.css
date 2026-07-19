@@ -1,5 +1,6 @@
 /* ═══════════════════════════════════════════════════════════
    Quick Edit — Floating Toolbar & Edit Popup
+   Visual style: dark glassmorphism, touch-friendly, responsive
    ═══════════════════════════════════════════════════════════ */
 
 /* ── Toolbar ─────────────────────────────────────────────── */
@@ -16,6 +17,19 @@
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
     align-items: center;
+    /* Prevent the toolbar itself from being text-selectable, which
+       would otherwise cause weird selection feedback on touch. */
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+    /* Subtle entrance animation */
+    animation: qe-pop-in 0.14s ease-out;
+}
+
+@keyframes qe-pop-in {
+    from { opacity: 0; transform: translateY(4px) scale(0.96); }
+    to   { opacity: 1; transform: translateY(0)   scale(1);    }
 }
 
 .qe-btn {
@@ -30,9 +44,12 @@
     align-items: center;
     justify-content: center;
     font-size: 13px;
-    transition: background 0.15s ease, transform 0.1s ease;
+    transition: background 0.15s ease, transform 0.1s ease, color 0.15s ease;
     padding: 0;
     line-height: 1;
+    /* Remove the 300ms tap delay on mobile */
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
 }
 
 .qe-btn:hover {
@@ -58,6 +75,7 @@
     position: fixed;
     z-index: 10001;
     width: 320px;
+    max-width: calc(100vw - 16px);
     padding: 14px;
     background: rgba(22, 22, 28, 0.98);
     border-radius: 12px;
@@ -66,6 +84,8 @@
     backdrop-filter: blur(14px);
     -webkit-backdrop-filter: blur(14px);
     box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+    animation: qe-pop-in 0.16s ease-out;
 }
 
 #qe-edit-textarea {
@@ -78,11 +98,13 @@
     border-radius: 8px;
     color: #e0e0e0;
     padding: 10px;
-    font-size: 14px;
+    /* >=16px prevents iOS Safari from auto-zooming on focus */
+    font-size: 16px;
     font-family: inherit;
     line-height: 1.5;
     box-sizing: border-box;
     margin: 0;
+    transition: border-color 0.15s ease;
 }
 
 #qe-edit-textarea:focus {
@@ -97,16 +119,22 @@
     justify-content: flex-end;
 }
 
-#qe-cancel-btn {
-    padding: 6px 16px;
+#qe-cancel-btn,
+#qe-save-btn {
+    padding: 8px 18px;            /* slightly larger for touch targets */
     border-radius: 6px;
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    background: transparent;
-    color: #aaa;
     cursor: pointer;
     font-size: 13px;
     font-family: inherit;
-    transition: background 0.15s ease;
+    transition: background 0.15s ease, color 0.15s ease, transform 0.1s ease;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+}
+
+#qe-cancel-btn {
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    background: transparent;
+    color: #aaa;
 }
 
 #qe-cancel-btn:hover {
@@ -114,19 +142,52 @@
     color: #ddd;
 }
 
+#qe-cancel-btn:active,
+#qe-save-btn:active {
+    transform: scale(0.96);
+}
+
 #qe-save-btn {
-    padding: 6px 16px;
-    border-radius: 6px;
     border: none;
     background: #4a6fa5;
     color: white;
-    cursor: pointer;
-    font-size: 13px;
     font-weight: 500;
-    font-family: inherit;
-    transition: background 0.15s ease;
 }
 
 #qe-save-btn:hover {
     background: #5a7fb5;
+}
+
+/* ── Responsive: enlarge touch targets on small screens ─── */
+@media (max-width: 480px) {
+    #qe-toolbar {
+        padding: 5px 8px;
+    }
+    .qe-btn {
+        width: 36px;
+        height: 36px;
+        font-size: 14px;
+    }
+    #qe-edit-popup {
+        width: calc(100vw - 16px);
+        left: 8px !important;     /* override inline left so it stays centered */
+    }
+    #qe-cancel-btn,
+    #qe-save-btn {
+        padding: 10px 20px;
+        font-size: 14px;
+    }
+}
+
+/* ── Reduced motion: drop the entrance animation ─────────── */
+@media (prefers-reduced-motion: reduce) {
+    #qe-toolbar,
+    #qe-edit-popup {
+        animation: none;
+    }
+    .qe-btn,
+    #qe-cancel-btn,
+    #qe-save-btn {
+        transition: none;
+    }
 }

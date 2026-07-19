@@ -13,9 +13,7 @@
  *     The toolbar is a flex container. We toggle visibility with a
  *     `.is-visible` class (NOT jQuery `.show()/.hide()`), because
  *     `.show()` sets `display:block` inline — overriding the CSS
- *     `display:flex` and causing the round buttons (which are
- *     themselves `display:flex` = block-level) to stack VERTICALLY.
- *     This was the "ikon vertikal" bug in v0.2.
+ *     `display:flex` and causing the round buttons to stack VERTICALLY.
  *
  *  2. TOOLBAR POSITION — defaults to BELOW the selection.
  *     Android's native text-action toolbar always appears ABOVE the
@@ -49,13 +47,9 @@
  *     `chat[i].mes` stayed at the old value → context log showed
  *     old text → AI received old text.
  *
- *     v0.3 (this version) uses `parseInt(mesId, 10)` as the array
- *     index directly, with a `findIndex` fallback for forward
- *     compatibility if ST ever adds a `mesid` field. It also:
- *       • syncs `mes.swipes[swipe_id]` so swipe-aware context works,
- *       • sets `mes.is_edited = true` so the "edited" badge shows,
- *       • calls ST's `updateMessageBlock(id, message)` so the DOM,
- *         token cache, and other extensions all see the edit.
+ *     v0.5 (this version) resolves the message index more defensively,
+ *     saves through ST's own update pipeline, and rolls back the DOM if
+ *     persist fails so the user never loses the original message.
  *
  *  6. HTML SAFETY — user-typed text is HTML-escaped before insert.
  *     `&` `<` `>` are escaped; `\n` is converted to `<br>` so
@@ -120,24 +114,21 @@ let resizeTimer = null;
 /** cached toolbar outer dimensions (measured once in createUI) */
 let toolbarWidth = 110;
 let toolbarHeight = 52;
+/** previous focus target before opening the popup */
+let previousFocusElement = null;
+/** snapshot for delete undo */
+let lastDeletedSnapshot = null;
+/** timeout handle for delete undo expiration */
+let lastDeleteUndoTimer = null;
 
-/** ignore transient selectionchange events for this long after a
- *  toolbar / popup interaction (ms). */
 const UI_GRACE_MS = 500;
-/** selectionchange debounce delay (ms). */
 const SELECTION_DEBOUNCE_MS = 250;
+const DELETE_UNDO_MS = 5000;
 
 /* =============================================================
    SETTINGS
    ============================================================= */
 
-/**
- * Load settings, merging defaults with saved values.
- *
- * We use `{ ...defaults, ...saved }` instead of "only apply defaults
- * if empty" so that future-added settings automatically get their
- * default for existing users without wiping their other choices.
- */
 function loadSettings() {
     extension_settings[extensionName] = extension_settings[extensionName] || {};
     const merged = { ...defaultSettings, ...extension_settings[extensionName] };
@@ -164,7 +155,7 @@ function onEnabledChange(event) {
    ============================================================= */
 
 function createUI() {
-    if ($("#qe-toolbar").length) return; // prevent duplicates
+    if ($("#qe-toolbar").length) return;
 
     $toolbar = $(`
         <div id="qe-toolbar" role="toolbar" aria-label="Quick edit toolbar">
@@ -180,7 +171,7 @@ function createUI() {
     `);
 
     $editPopup = $(`
-        <div id="qe-edit-popup" role="dialog" aria-label="Edit selected text">
+        <div id="qe-edit-popup" role="dialog" aria-modal="true" aria-label="Edit selected text">
             <textarea id="qe-edit-textarea"
                       placeholder="Edit selected text..."></textarea>
             <div id="qe-popup-buttons">
@@ -192,33 +183,48 @@ function createUI() {
 
     $("body").append($toolbar).append($editPopup);
 
-    // ── Measure toolbar dimensions once (while hidden, via visibility) ──
-    // We need real outerWidth/Height for accurate positioning. The
-    // toolbar is `display:none` by default, so we toggle a hidden
-    // visible state just to measure.
+    // Measure toolbar dimensions once while temporarily visible.
     $toolbar.css("visibility", "hidden").addClass("is-visible");
     toolbarWidth = $toolbar.outerWidth() || 110;
     toolbarHeight = $toolbar.outerHeight() || 52;
     $toolbar.removeClass("is-visible").css("visibility", "");
 
-    // ── Bind button actions to `pointerdown` ──
-    // Fires BEFORE the browser clears the text selection on touch,
-    // which is the fix for "the edit icon just closes when I tap it".
     bindQuickAction($("#qe-edit-btn"), onEditClick);
     bindQuickAction($("#qe-delete-btn"), onDeleteClick);
-    bindQuickAction($("#qe-cancel-btn"), hideEditPopup);
+    bindQuickAction($("#qe-cancel-btn"), () => hideEditPopup({ restoreFocus: true }));
     bindQuickAction($("#qe-save-btn"), onEditSave);
 
-    // Track any pointerdown on the toolbar / popup so we can ignore
-    // transient `selectionchange` events that follow.
     $toolbar.add($editPopup).on("pointerdown.qe-internal mousedown.qe-internal", () => {
         lastUiInteraction = Date.now();
+    });
+
+    $editPopup.on("keydown.qe-internal", function (e) {
+        if (e.key === "Escape") {
+            e.preventDefault();
+            hideEditPopup({ restoreFocus: true });
+            return;
+        }
+
+        if (e.key !== "Tab") return;
+
+        const focusables = $editPopup.find("#qe-edit-textarea, #qe-cancel-btn, #qe-save-btn").filter(":visible");
+        if (!focusables.length) return;
+
+        const currentIndex = focusables.index(document.activeElement);
+        if (currentIndex === -1) return;
+
+        const nextIndex = e.shiftKey
+            ? (currentIndex - 1 + focusables.length) % focusables.length
+            : (currentIndex + 1) % focusables.length;
+
+        e.preventDefault();
+        focusables.eq(nextIndex).trigger("focus");
     });
 
     $("#qe-edit-textarea").on("keydown", function (e) {
         if (e.key === "Escape") {
             e.preventDefault();
-            hideEditPopup();
+            hideEditPopup({ restoreFocus: true });
         }
         if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
             e.preventDefault();
@@ -227,24 +233,13 @@ function createUI() {
     });
 }
 
-/**
- * Bind a handler that fires on `pointerdown` (preferred) or
- * `mousedown` (fallback). Calling `e.preventDefault()` on these
- * early events prevents the browser from shifting focus away from
- * the page selection, which is what wiped `savedRange` before
- * `click` could run on mobile.
- *
- * The follow-up `click` is suppressed so the handler doesn't run
- * twice.
- */
 function bindQuickAction($el, handler) {
     const startEvent = window.PointerEvent ? "pointerdown" : "mousedown";
     let handled = false;
 
     $el.on(startEvent + ".qe-btn", function (e) {
-        // Only react to the primary button (left click / touch / pen).
         if (e.button && e.button !== 0) return;
-        e.preventDefault();            // prevent focus shift / selection clearing
+        e.preventDefault();
         handled = true;
         lastUiInteraction = Date.now();
         handler.call(this, e);
@@ -263,18 +258,28 @@ function bindQuickAction($el, handler) {
    SELECTION DETECTION
    ============================================================= */
 
+function getViewportMetrics() {
+    const vv = window.visualViewport;
+    return {
+        left: vv ? vv.offsetLeft : 0,
+        top: vv ? vv.offsetTop : 0,
+        width: vv ? vv.width : window.innerWidth,
+        height: vv ? vv.height : window.innerHeight
+    };
+}
+
+function normalizeNode(node) {
+    if (!node) return null;
+    return node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+}
+
 function handleSelection() {
     if (!extension_settings[extensionName]?.enabled) return;
-    if ($editPopup && $editPopup.hasClass("is-visible")) return; // don't hide while editing
+    if ($editPopup && $editPopup.hasClass("is-visible")) return;
 
     const sel = window.getSelection();
     const hasSelection = !!sel && !sel.isCollapsed && sel.toString().trim().length > 0;
 
-    // If the user just tapped a toolbar / popup button, the browser
-    // may briefly clear the selection (focus shift). Ignore those
-    // transient events so we don't lose `savedRange` — BUT only when
-    // there is no fresh selection. A new selection should always be
-    // honoured, even within the grace window.
     if (!hasSelection && Date.now() - lastUiInteraction < UI_GRACE_MS) {
         return;
     }
@@ -285,26 +290,32 @@ function handleSelection() {
     }
 
     const anchorNode = sel.anchorNode;
-    if (!anchorNode) { hideToolbar(); return; }
+    if (!anchorNode) {
+        hideToolbar();
+        return;
+    }
 
-    const anchorEl = anchorNode.nodeType === Node.TEXT_NODE
-        ? anchorNode.parentElement
-        : anchorNode;
-    if (!anchorEl) { hideToolbar(); return; }
+    const anchorEl = normalizeNode(anchorNode);
+    if (!anchorEl) {
+        hideToolbar();
+        return;
+    }
 
-    // Must be inside #chat .mes_text
     const mesText = $(anchorEl).closest("#chat .mes_text");
-    if (mesText.length === 0) { hideToolbar(); return; }
+    if (mesText.length === 0) {
+        hideToolbar();
+        return;
+    }
 
-    // Must be within a SINGLE message (no cross-message selection)
     const anchorMes = $(anchorEl).closest(".mes");
-    if (!anchorMes.length) { hideToolbar(); return; }
+    if (!anchorMes.length) {
+        hideToolbar();
+        return;
+    }
 
     const focusNode = sel.focusNode;
     if (focusNode) {
-        const focusEl = focusNode.nodeType === Node.TEXT_NODE
-            ? focusNode.parentElement
-            : focusNode;
+        const focusEl = normalizeNode(focusNode);
         const focusMes = focusEl ? $(focusEl).closest(".mes") : $();
         if (focusMes.length && anchorMes.attr("mesid") !== focusMes.attr("mesid")) {
             hideToolbar();
@@ -312,8 +323,8 @@ function handleSelection() {
         }
     }
 
-    // Save references
     currentMesEl = anchorMes;
+
     try {
         savedRange = sel.getRangeAt(0).cloneRange();
     } catch (e) {
@@ -325,40 +336,35 @@ function handleSelection() {
     $toolbar.addClass("is-visible");
 }
 
-/**
- * Position the floating toolbar relative to a Range.
- *
- * Default: BELOW the selection (so it doesn't collide with Android's
- * native text-action toolbar, which always appears above). Flips above
- * only when there's no room below, then clamps to the viewport.
- */
 function positionToolbar(range) {
+    if (!$toolbar || !range) return;
+
     const rect = range.getBoundingClientRect();
+    const vp = getViewportMetrics();
     const tbW = toolbarWidth;
     const tbH = toolbarHeight;
     const gap = 8;
+    const minX = vp.left + 4;
+    const minY = vp.top + 4;
+    const maxX = vp.left + vp.width - tbW - 4;
+    const maxY = vp.top + vp.height - tbH - 4;
 
-    // Default: BELOW the selection
-    let top = rect.bottom + gap;
-    let left = rect.left + (rect.width / 2) - (tbW / 2);
+    let top = vp.top + rect.bottom + gap;
+    let left = vp.left + rect.left + (rect.width / 2) - (tbW / 2);
 
-    // Flip above only if there's no room below
-    if (top + tbH > window.innerHeight - 4) {
-        top = rect.top - tbH - gap;
+    if (top + tbH > vp.top + vp.height - 4) {
+        top = vp.top + rect.top - tbH - gap;
     }
-    // Final clamp to viewport
-    if (top < 4) top = 4;
-    if (top + tbH > window.innerHeight - 4) top = window.innerHeight - tbH - 4;
 
-    if (left < 4) left = 4;
-    if (left + tbW > window.innerWidth - 4) left = window.innerWidth - tbW - 4;
+    top = Math.max(minY, Math.min(top, maxY));
+    left = Math.max(minX, Math.min(left, maxX));
 
     $toolbar.css({ top: `${top}px`, left: `${left}px` });
 }
 
 function hideToolbar() {
     if ($toolbar) $toolbar.removeClass("is-visible");
-    hideEditPopup();
+    hideEditPopup({ restoreFocus: false });
     savedRange = null;
     currentMesEl = null;
 }
@@ -367,11 +373,288 @@ function hideToolbar() {
    EDIT & DELETE ACTIONS
    ============================================================= */
 
+function isSelectionBoundToCurrentMessage() {
+    if (!savedRange || !currentMesEl || !currentMesEl.length) return false;
+    const mesNode = currentMesEl[0];
+    const ancestor = normalizeNode(savedRange.commonAncestorContainer);
+    return !!mesNode && !!ancestor && mesNode.contains(ancestor);
+}
+
+function captureMessageState(message) {
+    const swipeIndex = typeof message?.swipe_id === "number" ? message.swipe_id : null;
+    const swipeHtml = (
+        Array.isArray(message?.swipes) &&
+        swipeIndex !== null &&
+        swipeIndex >= 0 &&
+        swipeIndex < message.swipes.length
+    ) ? message.swipes[swipeIndex] : null;
+
+    return {
+        mes: message?.mes ?? "",
+        mes_text: message?.mes_text,
+        is_edited: Boolean(message?.is_edited),
+        swipe_id: swipeIndex,
+        swipe_html: swipeHtml
+    };
+}
+
+function restoreMessageState(message, snapshot) {
+    if (!message || !snapshot) return;
+
+    message.mes = snapshot.mes;
+    message.mes_text = snapshot.mes_text;
+    message.is_edited = snapshot.is_edited;
+
+    if (
+        Array.isArray(message.swipes) &&
+        typeof snapshot.swipe_id === "number" &&
+        snapshot.swipe_id >= 0 &&
+        snapshot.swipe_id < message.swipes.length &&
+        snapshot.swipe_html !== null &&
+        snapshot.swipe_html !== undefined
+    ) {
+        message.swipes[snapshot.swipe_id] = snapshot.swipe_html;
+    }
+}
+
+function clearDeleteUndo() {
+    if (lastDeleteUndoTimer) {
+        clearTimeout(lastDeleteUndoTimer);
+        lastDeleteUndoTimer = null;
+    }
+    lastDeletedSnapshot = null;
+}
+
+function registerDeleteUndo(idx, snapshot) {
+    clearDeleteUndo();
+    lastDeletedSnapshot = {
+        idx,
+        snapshot,
+        createdAt: Date.now()
+    };
+    lastDeleteUndoTimer = setTimeout(() => {
+        clearDeleteUndo();
+    }, DELETE_UNDO_MS);
+
+    notify(`Deleted. Press Ctrl+Z within ${DELETE_UNDO_MS / 1000} seconds to undo.`, "info");
+}
+
+function undoLastDelete() {
+    if (!lastDeletedSnapshot) return false;
+
+    const context = getContext();
+    if (!context || !Array.isArray(context.chat)) {
+        notify("Undo failed: chat context unavailable", "warning");
+        clearDeleteUndo();
+        return false;
+    }
+
+    const { idx, snapshot } = lastDeletedSnapshot;
+    if (idx < 0 || idx >= context.chat.length) {
+        notify("Undo failed: original message index is no longer valid", "warning");
+        clearDeleteUndo();
+        return false;
+    }
+
+    const message = context.chat[idx];
+    if (!message) {
+        notify("Undo failed: original message is no longer available", "warning");
+        clearDeleteUndo();
+        return false;
+    }
+
+    restoreMessageState(message, snapshot);
+
+    const mesEl = $("#chat .mes").eq(idx);
+    const $mesText = mesEl.find(".mes_text");
+    if ($mesText.length) {
+        $mesText.html(snapshot.mes);
+    }
+
+    if (typeof context.updateMessageBlock === "function") {
+        try {
+            context.updateMessageBlock(idx, message);
+        } catch (e) {
+            console.warn(`[${extensionName}] updateMessageBlock failed during undo (non-fatal):`, e);
+        }
+    }
+
+    if (typeof saveChatDebounced === "function") {
+        saveChatDebounced();
+    }
+
+    clearDeleteUndo();
+    notify("Delete undone.", "success");
+    return true;
+}
+
+function resolveMessageIndex(mesIdAttr, chat, mesEl) {
+    const direct = parseInt(mesIdAttr, 10);
+    if (!isNaN(direct) && direct >= 0 && direct < chat.length) {
+        return direct;
+    }
+
+    const domIdx = mesEl?.length ? $("#chat .mes").index(mesEl[0]) : -1;
+    if (domIdx >= 0 && domIdx < chat.length) {
+        return domIdx;
+    }
+
+    return chat.findIndex(m => String(m?.mesid) === String(mesIdAttr));
+}
+
+function applyRangeEdit(range, newText) {
+    try {
+        const sel = window.getSelection();
+        if (sel) {
+            sel.removeAllRanges();
+            sel.addRange(range);
+        }
+
+        range.deleteContents();
+
+        if (newText.length > 0) {
+            const html = escapeHtml(newText).replace(/\n/g, "<br>");
+            const tempDiv = document.createElement("div");
+            tempDiv.innerHTML = html;
+            const fragment = document.createDocumentFragment();
+            while (tempDiv.firstChild) {
+                fragment.appendChild(tempDiv.firstChild);
+            }
+            range.insertNode(fragment);
+        }
+
+        const common = range.commonAncestorContainer;
+        if (common && typeof common.normalize === "function") {
+            common.normalize();
+        }
+
+        return true;
+    } catch (e) {
+        console.error(`[${extensionName}] applyRangeEdit failed:`, e);
+        notify("Could not apply the edit to the selected text.", "warning");
+        return false;
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function saveMessageChanges({ previousState = null, action = "edit" } = {}) {
+    if (!currentMesEl) return false;
+
+    const mesIdAttr = $(currentMesEl).attr("mesid");
+    if (mesIdAttr === undefined) {
+        console.error(`[${extensionName}] No mesid found on element`, currentMesEl);
+        notify("Could not resolve the selected message.", "warning");
+        return false;
+    }
+
+    const context = getContext();
+    if (!context || !Array.isArray(context.chat)) {
+        console.error(`[${extensionName}] getContext() or chat array unavailable`);
+        notify("Could not access SillyTavern chat data.", "warning");
+        return false;
+    }
+
+    const idx = resolveMessageIndex(mesIdAttr, context.chat, currentMesEl);
+    if (idx === -1) {
+        console.error(
+            `[${extensionName}] Could not resolve mesid "${mesIdAttr}" to a chat index ` +
+            `(chat length: ${context.chat.length})`
+        );
+        notify("Could not map the selected text back to a chat message.", "warning");
+        return false;
+    }
+
+    const message = context.chat[idx];
+    if (!message) {
+        console.error(`[${extensionName}] chat[${idx}] is null/undefined`);
+        notify("Selected chat message is no longer available.", "warning");
+        return false;
+    }
+
+    const $mesText = $(currentMesEl).find(".mes_text");
+    if ($mesText.length === 0) {
+        console.error(`[${extensionName}] .mes_text not found inside message element`);
+        notify("Could not find the editable text block for this message.", "warning");
+        return false;
+    }
+
+    const previousSnapshot = previousState || captureMessageState(message);
+    const newHtml = $mesText.html();
+
+    try {
+        message.mes = newHtml;
+        message.mes_text = newHtml;
+        message.is_edited = true;
+
+        if (Array.isArray(message.swipes) && typeof message.swipe_id === "number") {
+            message.swipes[message.swipe_id] = newHtml;
+        }
+
+        if (typeof context.updateMessageBlock === "function") {
+            try {
+                context.updateMessageBlock(idx, message);
+            } catch (e) {
+                console.warn(`[${extensionName}] updateMessageBlock failed (non-fatal):`, e);
+            }
+        }
+
+        if (typeof saveChatDebounced === "function") {
+            saveChatDebounced();
+        } else {
+            throw new Error("saveChatDebounced not available");
+        }
+
+        if (action === "delete") {
+            registerDeleteUndo(idx, previousSnapshot);
+        } else {
+            clearDeleteUndo();
+        }
+
+        console.log(
+            `[${extensionName}] Message ${idx} updated & saved ` +
+            `(${previousSnapshot.mes.length} → ${newHtml.length} chars)`
+        );
+        return true;
+    } catch (e) {
+        console.error(`[${extensionName}] Persist failed, rolling back:`, e);
+        restoreMessageState(message, previousSnapshot);
+        if ($mesText.length) {
+            $mesText.html(previousSnapshot.mes);
+        }
+
+        if (typeof context.updateMessageBlock === "function") {
+            try {
+                context.updateMessageBlock(idx, message);
+            } catch (rollbackError) {
+                console.warn(`[${extensionName}] rollback updateMessageBlock failed:`, rollbackError);
+            }
+        }
+
+        if (typeof saveChatDebounced === "function") {
+            try {
+                saveChatDebounced();
+            } catch (saveError) {
+                console.warn(`[${extensionName}] rollback saveChatDebounced failed:`, saveError);
+            }
+        }
+
+        notify("The edit could not be saved and was rolled back.", "warning");
+        return false;
+    }
+}
+
 function onEditClick() {
     if (!savedRange || !currentMesEl) return;
+    if (!isSelectionBoundToCurrentMessage()) {
+        notify("Selection is no longer valid. Please select the text again.", "warning");
+        return;
+    }
 
-    // Streaming guard — refuse to edit a message that is currently
-    // being generated. The stream writer would overwrite our edit.
     const mesId = $(currentMesEl).attr("mesid");
     const idx = parseInt(mesId, 10);
     const ctx = getContext();
@@ -380,15 +663,14 @@ function onEditClick() {
         return;
     }
 
+    clearDeleteUndo();
+
+    previousFocusElement = document.activeElement;
     const $textarea = $("#qe-edit-textarea");
     $textarea.val(savedRange.toString());
 
     positionEditPopup();
 
-    // Focus WITHOUT `.select()` — `.select()` highlighted the entire
-    // textarea contents, which the user reported as "it selects all
-    // the text". Instead, place the caret at the end so the user can
-    // append, re-select, or use Ctrl+A themselves.
     const ta = $textarea[0];
     ta.focus();
     const len = ta.value.length;
@@ -397,179 +679,67 @@ function onEditClick() {
 
 function onEditSave() {
     if (!savedRange || !currentMesEl) return;
+    if (!isSelectionBoundToCurrentMessage()) {
+        notify("Selection changed before saving. Please try again.", "warning");
+        return;
+    }
 
-    const newText = $("#qe-edit-textarea").val();
-    applyRangeEdit(savedRange, newText);
-    saveMessageChanges();
+    const previousState = getCurrentMessageState();
+    if (!previousState) return;
+
+    const newText = String($("#qe-edit-textarea").val() ?? "");
+    if (!applyRangeEdit(savedRange, newText)) {
+        return;
+    }
+
+    if (!saveMessageChanges({ previousState, action: "edit" })) {
+        return;
+    }
+
     hideToolbar();
     clearSelection();
 }
 
 function onDeleteClick() {
     if (!savedRange || !currentMesEl) return;
+    if (!isSelectionBoundToCurrentMessage()) {
+        notify("Selection changed before deleting. Please try again.", "warning");
+        return;
+    }
 
-    applyRangeEdit(savedRange, "");
-    saveMessageChanges();
+    const previousState = getCurrentMessageState();
+    if (!previousState) return;
+
+    if (!applyRangeEdit(savedRange, "")) {
+        return;
+    }
+
+    if (!saveMessageChanges({ previousState, action: "delete" })) {
+        return;
+    }
+
     hideToolbar();
     clearSelection();
+}
+
+function getCurrentMessageState() {
+    if (!currentMesEl) return null;
+
+    const mesIdAttr = $(currentMesEl).attr("mesid");
+    if (mesIdAttr === undefined) return null;
+
+    const context = getContext();
+    if (!context || !Array.isArray(context.chat)) return null;
+
+    const idx = resolveMessageIndex(mesIdAttr, context.chat, currentMesEl);
+    if (idx === -1 || !context.chat[idx]) return null;
+
+    return captureMessageState(context.chat[idx]);
 }
 
 function clearSelection() {
     const sel = window.getSelection();
     if (sel) sel.removeAllRanges();
-}
-
-/**
- * Escape HTML special characters in user-typed text.
- * Prevents `<script>` injection and HTML structure corruption.
- */
-function escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
-}
-
-/**
- * Replace the contents of a Range with new text (or "" to delete).
- *
- * The new text is HTML-escaped (so `<` becomes `&lt;` etc.) and
- * newlines are converted to `<br>` so multi-line edits render as
- * line breaks instead of being collapsed by HTML's default
- * whitespace handling.
- */
-function applyRangeEdit(range, newText) {
-    const sel = window.getSelection();
-    sel.removeAllRanges();
-    sel.addRange(range);
-
-    range.deleteContents();
-
-    if (newText.length > 0) {
-        // Escape HTML entities, then convert newlines to <br>.
-        const html = escapeHtml(newText).replace(/\n/g, "<br>");
-
-        // Parse into a fragment so we can insert nodes directly
-        // (avoids wrapping in an extra <div>).
-        const tempDiv = document.createElement("div");
-        tempDiv.innerHTML = html;
-        const fragment = document.createDocumentFragment();
-        while (tempDiv.firstChild) {
-            fragment.appendChild(tempDiv.firstChild);
-        }
-        range.insertNode(fragment);
-    }
-
-    // Merge adjacent text nodes so innerHTML stays clean
-    const common = range.commonAncestorContainer;
-    if (common && typeof common.normalize === "function") {
-        common.normalize();
-    }
-}
-
-/* =============================================================
-   PERSIST TO SILLYTAVERN CHAT DATA
-   ============================================================= */
-
-/**
- * Resolve a DOM `mesid` attribute to an index into `context.chat`.
- *
- * In SillyTavern, the DOM `mesid` attribute equals the array index
- * (see ST source: `chat[mesElement.attr('mesid')]`). Message objects
- * do NOT have a `mesid` field, so a `findIndex` by `m.mesid` always
- * returns -1 — which is exactly why v0.2 edits never reached the AI.
- *
- * We use `parseInt` as the primary path and fall back to `findIndex`
- * by `m.mesid` only if ST ever introduces such a field in the future.
- */
-function resolveMessageIndex(mesIdAttr, chat) {
-    const direct = parseInt(mesIdAttr, 10);
-    if (!isNaN(direct) && direct >= 0 && direct < chat.length) {
-        return direct;
-    }
-    // Forward-compat fallback: search by `mesid` field if it ever
-    // gets introduced.
-    return chat.findIndex(m => String(m?.mesid) === String(mesIdAttr));
-}
-
-function saveMessageChanges() {
-    if (!currentMesEl) return;
-
-    const mesIdAttr = $(currentMesEl).attr("mesid");
-    if (mesIdAttr === undefined) {
-        console.error(`[${extensionName}] No mesid found on element`, currentMesEl);
-        return;
-    }
-
-    const context = getContext();
-    if (!context || !Array.isArray(context.chat)) {
-        console.error(`[${extensionName}] getContext() or chat array unavailable`);
-        return;
-    }
-
-    const idx = resolveMessageIndex(mesIdAttr, context.chat);
-    if (idx === -1) {
-        console.error(
-            `[${extensionName}] Could not resolve mesid "${mesIdAttr}" to a chat index ` +
-            `(chat length: ${context.chat.length})`
-        );
-        return;
-    }
-
-    const message = context.chat[idx];
-    if (!message) {
-        console.error(`[${extensionName}] chat[${idx}] is null/undefined`);
-        return;
-    }
-
-    const $mesText = $(currentMesEl).find(".mes_text");
-    if ($mesText.length === 0) {
-        console.error(`[${extensionName}] .mes_text not found inside message element`);
-        return;
-    }
-
-    const newHtml = $mesText.html();
-    const oldLen = (message.mes || "").length;
-
-    // ── Persist the edit to all the places SillyTavern reads from ──
-    // 1. `mes`           — the canonical field; used for AI context,
-    //                      reload, and message re-rendering.
-    // 2. `swipes[cur]`   — if the message has swipes, the current
-    //                      swipe must also be updated, otherwise
-    //                      switching swipes would undo our edit.
-    // 3. `is_edited`     — so ST shows the "edited" badge.
-    // 4. `mes_text`      — mirror for any third-party code that
-    //                      reads this (non-standard) field.
-    message.mes = newHtml;
-    if (Array.isArray(message.swipes) && typeof message.swipe_id === "number") {
-        message.swipes[message.swipe_id] = newHtml;
-    }
-    message.is_edited = true;
-    message.mes_text = newHtml;
-
-    // ── Re-render via ST's own API so DOM, token cache, and other
-    //    extensions all see the edit. Falls back gracefully if the
-    //    function signature changes in a future ST version. ──
-    if (typeof context.updateMessageBlock === "function") {
-        try {
-            context.updateMessageBlock(idx, message);
-        } catch (e) {
-            console.warn(`[${extensionName}] updateMessageBlock failed (non-fatal):`, e);
-        }
-    }
-
-    // ── Persist to disk ──
-    if (typeof saveChatDebounced === "function") {
-        saveChatDebounced();
-        console.log(
-            `[${extensionName}] Message ${idx} updated & saved ` +
-            `(${oldLen} → ${newHtml.length} chars)`
-        );
-    } else {
-        console.warn(
-            `[${extensionName}] saveChatDebounced not available — ` +
-            `edit applied to DOM but NOT persisted to disk`
-        );
-    }
 }
 
 /* =============================================================
@@ -579,46 +749,68 @@ function saveMessageChanges() {
 function positionEditPopup() {
     if (!$toolbar || !$editPopup) return;
     const tbRect = $toolbar[0].getBoundingClientRect();
+    const vp = getViewportMetrics();
     const gap = 8;
 
-    // Show first so we can measure real dimensions (CSS makes the
-    // popup `display:none` by default).
     $editPopup.addClass("is-visible");
 
     const popW = $editPopup.outerWidth() || 320;
     const popH = $editPopup.outerHeight() || 180;
 
-    let top = tbRect.bottom + gap;
-    let left = tbRect.left;
+    let top = vp.top + tbRect.bottom + gap;
+    let left = vp.left + tbRect.left;
 
-    if (top + popH > window.innerHeight - 4) top = tbRect.top - popH - gap;
-    if (top < 4) top = 4;
-    if (left + popW > window.innerWidth - 4) left = window.innerWidth - popW - 4;
-    if (left < 4) left = 4;
+    if (top + popH > vp.top + vp.height - 4) top = vp.top + tbRect.top - popH - gap;
+    if (top < vp.top + 4) top = vp.top + 4;
+    if (left + popW > vp.left + vp.width - 4) left = vp.left + vp.width - popW - 4;
+    if (left < vp.left + 4) left = vp.left + 4;
 
     $editPopup.css({ top: `${top}px`, left: `${left}px` });
 }
 
-function hideEditPopup() {
+function hideEditPopup({ restoreFocus = false } = {}) {
     if ($editPopup) $editPopup.removeClass("is-visible");
+    if (restoreFocus) {
+        restorePreviousFocus();
+    }
+}
+
+function restorePreviousFocus() {
+    const target = previousFocusElement;
+    previousFocusElement = null;
+
+    if (!target || typeof target.focus !== "function") {
+        return;
+    }
+
+    if (!document.contains(target)) {
+        return;
+    }
+
+    try {
+        target.focus({ preventScroll: true });
+    } catch (e) {
+        try {
+            target.focus();
+        } catch (_) {
+            // ignore
+        }
+    }
 }
 
 /* =============================================================
    UTILITIES
    ============================================================= */
 
-/**
- * Show a toastr notification if toastr is available (SillyTavern
- * always loads it). Falls back to console.log so the message is
- * never lost.
- */
 function notify(message, type = "info") {
     try {
         if (typeof toastr !== "undefined" && typeof toastr[type] === "function") {
             toastr[type](message);
             return;
         }
-    } catch (e) { /* fall through */ }
+    } catch (e) {
+        // fall through
+    }
     console.log(`[${extensionName}] ${type}: ${message}`);
 }
 
@@ -631,10 +823,6 @@ function onSelectionChangeHandler() {
     selectionTimer = setTimeout(handleSelection, SELECTION_DEBOUNCE_MS);
 }
 
-/**
- * Scroll handler — hides the toolbar when the page scrolls, unless
- * the edit popup is open (in which case we don't disrupt editing).
- */
 function onScrollHide() {
     if (
         $toolbar && $toolbar.hasClass("is-visible") &&
@@ -644,101 +832,79 @@ function onScrollHide() {
     }
 }
 
-/**
- * Viewport change handler — fires on `window.resize` AND
- * `visualViewport.resize` (the latter fires when the mobile keyboard
- * appears/disappears).
- *
- * CRITICAL: If the edit popup is open, we DO NOT close it. On mobile,
- * the keyboard appearing triggers this handler, and closing the popup
- * mid-edit is the most frustrating bug. We only reposition the popup
- * if it's now off-screen.
- *
- * If only the toolbar is open (no popup), we hide it because the
- * saved Range's bounding rect is stale after a viewport change.
- *
- * The handler is debounced (150ms) because resize/visualViewport
- * events fire many times during a keyboard appear animation.
- */
 function onViewportChange() {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
-        // If the popup is open, the user is editing. NEVER close it.
-        // Just reposition if off-screen (keyboard may have shrunk viewport).
         if ($editPopup && $editPopup.hasClass("is-visible")) {
             repositionPopupForViewport();
             return;
         }
-        // Otherwise, hide the toolbar (saved Range rect is stale).
         if ($toolbar && $toolbar.hasClass("is-visible")) {
             hideToolbar();
         }
     }, 150);
 }
 
-/**
- * Reposition the edit popup if it's off-screen after a viewport
- * change (e.g. mobile keyboard appearing). Uses `visualViewport`
- * when available for accurate keyboard-aware positioning.
- *
- * If the popup is already fully visible, this is a no-op (avoids jank).
- */
 function repositionPopupForViewport() {
     if (!$editPopup || !$editPopup.hasClass("is-visible")) return;
 
-    // Use visualViewport if available — it accounts for the mobile
-    // keyboard, unlike window.innerHeight.
-    const vv = window.visualViewport;
-    const vh = vv ? vv.height : window.innerHeight;
-    const vw = vv ? vv.width : window.innerWidth;
-
+    const vp = getViewportMetrics();
     const rect = $editPopup[0].getBoundingClientRect();
 
-    // If popup is fully visible, don't move it (avoids jank).
-    if (rect.top >= 4 && rect.bottom <= vh - 4 &&
-        rect.left >= 4 && rect.right <= vw - 4) {
+    if (
+        rect.top >= vp.top + 4 &&
+        rect.bottom <= vp.top + vp.height - 4 &&
+        rect.left >= vp.left + 4 &&
+        rect.right <= vp.left + vp.width - 4
+    ) {
         return;
     }
 
-    // Center it in the visible area.
     const popW = $editPopup.outerWidth() || 320;
     const popH = $editPopup.outerHeight() || 180;
 
-    let top = Math.max(4, (vh - popH) / 2);
-    let left = Math.max(4, (vw - popW) / 2);
+    let top = Math.max(vp.top + 4, vp.top + (vp.height - popH) / 2);
+    let left = Math.max(vp.left + 4, vp.left + (vp.width - popW) / 2);
 
     $editPopup.css({ top: `${top}px`, left: `${left}px` });
 }
 
 function startListening() {
-    // Desktop: mouseup → finalize selection then check
     $(document).on("mouseup.qe", function (e) {
         if ($(e.target).closest("#qe-toolbar, #qe-edit-popup").length) return;
         setTimeout(handleSelection, 10);
     });
 
-    // Mobile / keyboard / accessibility: selectionchange (debounced)
     document.addEventListener("selectionchange", onSelectionChangeHandler);
 
-    // Click outside toolbar / popup / chat → dismiss
     $(document).on("mousedown.qe", function (e) {
         if (!$(e.target).closest("#qe-toolbar, #qe-edit-popup, #chat .mes_text").length) {
             hideToolbar();
         }
     });
 
-    // Escape → dismiss
     $(document).on("keydown.qe", function (e) {
-        if (e.key === "Escape") hideToolbar();
+        if (e.key === "Escape") {
+            if ($editPopup && $editPopup.hasClass("is-visible")) {
+                hideEditPopup({ restoreFocus: true });
+            } else {
+                hideToolbar();
+            }
+            return;
+        }
+
+        const target = e.target;
+        if ($(target).closest("#qe-edit-popup").length) {
+            return;
+        }
+
+        if ((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === "z" && lastDeletedSnapshot) {
+            e.preventDefault();
+            undoLastDelete();
+        }
     });
 
-    // Scroll → hide. Use capture phase so we catch scrolls on inner
-    // containers (e.g. #chat) which don't bubble to document.
     window.addEventListener("scroll", onScrollHide, true);
-
-    // Viewport changes (resize / keyboard) — see onViewportChange.
-    // CRITICAL: must NOT close the popup on these events, because
-    // on mobile the keyboard appearing fires resize.
     window.addEventListener("resize", onViewportChange);
     if (window.visualViewport) {
         window.visualViewport.addEventListener("resize", onViewportChange);
@@ -758,6 +924,7 @@ function stopListening() {
     document.removeEventListener("selectionchange", onSelectionChangeHandler);
     clearTimeout(selectionTimer);
     clearTimeout(resizeTimer);
+    clearDeleteUndo();
     hideToolbar();
 }
 

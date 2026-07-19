@@ -7,8 +7,7 @@
    IMPORTANT: visibility is toggled with the `.is-visible` class,
    NOT jQuery `.show()/.hide()`. Using `.show()` sets an inline
    `display:block` which overrides the `display:flex` below and
-   causes the round buttons (which are themselves `display:flex`
-   = block-level) to stack VERTICALLY. This was the v0.2
+   causes the round buttons to stack VERTICALLY. This was the v0.2
    "ikon vertikal" bug. */
 #qe-toolbar {
     display: none;
@@ -74,6 +73,11 @@
     transform: scale(0.93);
 }
 
+.qe-btn:focus-visible {
+    outline: 2px solid rgba(126, 184, 247, 0.85);
+    outline-offset: 2px;
+}
+
 #qe-edit-btn:hover {
     color: #7eb8f7;
 }
@@ -89,6 +93,9 @@
     z-index: 10001;
     width: 320px;
     max-width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px);
+    overflow: auto;
+    overscroll-behavior: contain;
     padding: 14px;
     background: rgba(22, 22, 28, 0.98);
     border-radius: 12px;
@@ -134,6 +141,7 @@
     gap: 8px;
     margin-top: 10px;
     justify-content: flex-end;
+    flex-wrap: wrap;
 }
 
 #qe-cancel-btn,
@@ -146,6 +154,12 @@
     transition: background 0.15s ease, color 0.15s ease, transform 0.1s ease;
     touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
+}
+
+#qe-cancel-btn:focus-visible,
+#qe-save-btn:focus-visible {
+    outline: 2px solid rgba(126, 184, 247, 0.85);
+    outline-offset: 2px;
 }
 
 #qe-cancel-btn {

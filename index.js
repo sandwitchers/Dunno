@@ -113,10 +113,19 @@
  *     v0.5 fired a toastr on every delete, which stacks up when the
  *     user deletes repeatedly. v0.5.1 uses a single ephemeral toast
  *     with a shorter message and replaces any previous one.
+ *
+ * 15. SOURCE-OF-TRUTH EDITS (v0.5.2).
+ *     v0.5.1 wrote the RENDERED html (`$mesText.html()`) into `message.mes`,
+ *     which holds raw markdown. That baked `<em>`, `<p>`, `<br>` and
+ *     substituted macros into the chat file and the prompt. v0.5.2 edits
+ *     the raw `mes` string instead (exact unique match, see util.js) and
+ *     refuses ambiguous selections. `mes_text` is not a real field and is
+ *     no longer written.
  */
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, saveChatDebounced } from "../../../../script.js";
+import { replaceOnce } from "./util.js";
 
 const extensionName = "Dunno";
 const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
@@ -282,6 +291,9 @@ function bindQuickAction($el, handler) {
         if (handled) {
             e.preventDefault();
             e.stopImmediatePropagation();
+        } else if (e.detail === 0) {
+            // Enter/Space fire a click with detail 0 and no pointerdown.
+            handler.call(this, e);
         }
     });
 }
@@ -429,7 +441,6 @@ function captureMessageState(message) {
 
     return {
         mes: message?.mes ?? "",
-        mes_text: message?.mes_text,
         is_edited: Boolean(message?.is_edited),
         swipe_id: swipeIndex,
         swipe_html: swipeHtml
@@ -440,7 +451,6 @@ function restoreMessageState(message, snapshot) {
     if (!message || !snapshot) return;
 
     message.mes = snapshot.mes;
-    message.mes_text = snapshot.mes_text;
     message.is_edited = snapshot.is_edited;
 
     if (
@@ -483,9 +493,9 @@ function registerDeleteUndo(idx, snapshot) {
     // Single ephemeral toast — clears any prior undo toast first so
     // rapid deletes don't stack up a wall of notifications.
     lastUndoToastClear = notify(
-        `Deleted. Ctrl+Z to undo (${DELETE_UNDO_MS / 1000}s).`,
+        "Deleted. Tap here to undo (or Ctrl+Z).",
         "info",
-        { timeOut: UNDO_TOAST_MS }
+        { timeOut: UNDO_TOAST_MS, onclick: undoLastDelete }
     );
 }
 
@@ -592,8 +602,8 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-function saveMessageChanges({ previousState = null, action = "edit" } = {}) {
-    if (!currentMesEl) return false;
+function saveMessageChanges({ previousState = null, action = "edit", nextMes } = {}) {
+    if (!currentMesEl || typeof nextMes !== "string") return false;
 
     const mesIdAttr = $(currentMesEl).attr("mesid");
     if (mesIdAttr === undefined) {
@@ -634,15 +644,13 @@ function saveMessageChanges({ previousState = null, action = "edit" } = {}) {
     }
 
     const previousSnapshot = previousState || captureMessageState(message);
-    const newHtml = $mesText.html();
 
     try {
-        message.mes = newHtml;
-        message.mes_text = newHtml;
+        message.mes = nextMes;
         message.is_edited = true;
 
         if (Array.isArray(message.swipes) && typeof message.swipe_id === "number") {
-            message.swipes[message.swipe_id] = newHtml;
+            message.swipes[message.swipe_id] = nextMes;
         }
 
         if (typeof context.updateMessageBlock === "function") {
@@ -667,7 +675,7 @@ function saveMessageChanges({ previousState = null, action = "edit" } = {}) {
 
         console.log(
             `[${extensionName}] Message ${idx} updated & saved ` +
-            `(${previousSnapshot.mes.length} → ${newHtml.length} chars)`
+            `(${previousSnapshot.mes.length} → ${nextMes.length} chars)`
         );
         return true;
     } catch (e) {
@@ -747,11 +755,14 @@ function onEditSave() {
     if (!previousState) return;
 
     const newText = String($("#qe-edit-textarea").val() ?? "");
+    const nextMes = resolveRawEdit(savedRange.toString(), newText);
+    if (nextMes === null) return;
+
     if (!applyRangeEdit(savedRange, newText)) {
         return;
     }
 
-    if (!saveMessageChanges({ previousState, action: "edit" })) {
+    if (!saveMessageChanges({ previousState, action: "edit", nextMes })) {
         // Persist failed and was rolled back. The DOM has been
         // restored to its pre-edit state, which means `savedRange`
         // now references DETACHED nodes (the rollback did
@@ -785,11 +796,14 @@ function onDeleteClick() {
     const previousState = getCurrentMessageState();
     if (!previousState) return;
 
+    const nextMes = resolveRawEdit(savedRange.toString(), "");
+    if (nextMes === null) return;
+
     if (!applyRangeEdit(savedRange, "")) {
         return;
     }
 
-    if (!saveMessageChanges({ previousState, action: "delete" })) {
+    if (!saveMessageChanges({ previousState, action: "delete", nextMes })) {
         // Same rollback rationale as onEditSave: savedRange is now
         // pointing into detached DOM, must invalidate.
         savedRange = null;
@@ -803,7 +817,7 @@ function onDeleteClick() {
     clearSelection();
 }
 
-function getCurrentMessageState() {
+function getCurrentMessage() {
     if (!currentMesEl) return null;
 
     const mesIdAttr = $(currentMesEl).attr("mesid");
@@ -813,9 +827,26 @@ function getCurrentMessageState() {
     if (!context || !Array.isArray(context.chat)) return null;
 
     const idx = resolveMessageIndex(mesIdAttr, context.chat, currentMesEl);
-    if (idx === -1 || !context.chat[idx]) return null;
+    return idx === -1 ? null : (context.chat[idx] ?? null);
+}
 
-    return captureMessageState(context.chat[idx]);
+function getCurrentMessageState() {
+    const message = getCurrentMessage();
+    return message ? captureMessageState(message) : null;
+}
+
+/**
+ * Apply the edit to the message's RAW source (`mes`), not the rendered DOM.
+ * Returns the new source, or null (with a toast) when the selection can't
+ * be located exactly once. See replaceOnce() in util.js.
+ */
+function resolveRawEdit(selectedText, newText) {
+    const message = getCurrentMessage();
+    const next = message ? replaceOnce(String(message.mes ?? ""), selectedText, newText) : null;
+    if (next === null) {
+        notify("Couldn't match that selection in the message source. Try a slightly longer, plain-text phrase.", "warning");
+    }
+    return next;
 }
 
 function clearSelection() {
@@ -1013,7 +1044,7 @@ function startListening() {
         }
 
         const target = e.target;
-        if ($(target).closest("#qe-edit-popup").length) {
+        if ($(target).closest("#qe-edit-popup, input, textarea, [contenteditable='true']").length) {
             return;
         }
 
@@ -1032,9 +1063,8 @@ function startListening() {
 
 function stopListening() {
     $(document).off(".qe");
-    $("#qe-edit-btn, #qe-delete-btn, #qe-cancel-btn, #qe-save-btn").off(".qe-btn");
-    $toolbar && $toolbar.off(".qe-internal");
-    $editPopup && $editPopup.off(".qe-internal");
+    // Button/popup handlers are bound once in createUI(); only the
+    // document/window listeners from startListening() are removed here.
     window.removeEventListener("scroll", onScrollHide, true);
     window.removeEventListener("resize", onViewportChange);
     if (window.visualViewport) {

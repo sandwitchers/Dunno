@@ -1,134 +1,26 @@
 /**
- * Quick Edit — SillyTavern third-party extension
+ * Quick Edit — SillyTavern / TauriTavern extension
  *
- * Lets the user select any portion of a chat message and edit / delete
- * just that portion via a floating toolbar, without opening SillyTavern's
- * full-message editor.
+ * Select text in a chat message -> a small capsule appears below the
+ * selection with Edit / Delete. Edits go into the raw message source
+ * (see util.js). On/off lives in the burger (options) menu.
  *
- * ═══════════════════════════════════════════════════════════════
- *  DESIGN NOTES & ROOT-CAUSE LOG (read before touching this file)
- * ═══════════════════════════════════════════════════════════════
- *
- *  1. TOOLBAR LAYOUT — must stay horizontal.
- *     The toolbar is a flex container. We toggle visibility with a
- *     `.is-visible` class (NOT jQuery `.show()/.hide()`), because
- *     `.show()` sets `display:block` inline — overriding the CSS
- *     `display:flex` and causing the round buttons to stack VERTICALLY.
- *
- *  2. TOOLBAR POSITION — defaults to BELOW the selection.
- *     Android's native text-action toolbar always appears ABOVE the
- *     selection, so an above-ours would collide with it. We only
- *     flip above when there's no room below.
- *
- *  3. BUTTON EVENTS — `pointerdown`, not `click`.
- *     On touch devices, `click` is delayed long enough for
- *     `selectionchange` to fire and wipe the saved Range before the
- *     click handler runs. Binding to `pointerdown` (with `mousedown`
- *     fallback) fires BEFORE the browser clears the selection. A
- *     `lastUiInteraction` grace window (500ms) makes `selectionchange`
- *     ignore transient focus-shift events after a toolbar tap.
- *
- *  4. TEXTAREA FOCUS — no `.select()`.
- *     `.select()` highlighted the entire textarea contents, which the
- *     user reported as "selecting all the text". Caret is now placed
- *     at the end via `setSelectionRange(len, len)`.
- *
- *  5. MESSAGE PERSISTENCE — the critical fix.
- *     SillyTavern's `chat` array is indexed by position. The DOM
- *     `mesid` attribute equals that array index (see ST source:
- *     `chat[mesElement.attr('mesid')]`).
- *
- *     v0.1 wrote to `chat[i].mes_text` (not a real field — edits
- *     vanished on reload).
- *     v0.2 wrote to `chat[i].mes` but used
- *         `findIndex(m => String(m.mesid) === String(mesId))`
- *     which ALWAYS returned -1 because message objects don't have a
- *     `mesid` property. `saveMessageChanges()` silently bailed, so
- *     `chat[i].mes` stayed at the old value → context log showed
- *     old text → AI received old text.
- *
- *     v0.5 (this version) resolves the message index more defensively,
- *     saves through ST's own update pipeline, and rolls back the DOM if
- *     persist fails so the user never loses the original message.
- *
- *  6. HTML SAFETY — user-typed text is HTML-escaped before insert.
- *     `&` `<` `>` are escaped; `\n` is converted to `<br>` so
- *     multi-line edits render as line breaks (not literal `\n`).
- *     Without this, typing `<script>` or a newline would corrupt the
- *     message DOM.
- *
- *  7. STREAMING GUARD — editing a message that is currently being
- *     streamed would race with ST's stream writer. We refuse the edit
- *     with a toastr warning instead.
- *
- *  8. SETTINGS MIGRATION — defaults are merged with saved values
- *     (`{ ...defaults, ...saved }`) instead of only applied when the
- *     saved object is empty. This means we can add new settings in
- *     the future without breaking existing users.
- *
- *  9. VIEWPORT CHANGES (KEYBOARD) — CRITICAL FIX in v0.4.
- *     On mobile, the soft keyboard appearing fires `resize` AND
- *     `visualViewport.resize` events. v0.3's `onResizeHide` closed
- *     the popup on these events, which meant every attempt to type
- *     in the edit textarea was immediately killed by the keyboard
- *     appearing — the most frustrating bug in the extension.
- *
- *     v0.4 NEVER closes the popup on viewport changes. It only
- *     repositions the popup if it's off-screen, using
- *     `visualViewport` for keyboard-aware positioning. The toolbar
- *     (without popup) is still hidden on resize because its saved
- *     Range rect is stale.
- *
- * 10. POPUP INVARIANCE — the edit popup is only closed by explicit
- *     user actions: Save, Cancel, Escape, or clicking outside.
- *     System events (resize, scroll, selectionchange) NEVER close
- *     the popup. This is enforced by every handler checking
- *     `$editPopup.hasClass("is-visible")` before touching the popup.
- *
- * 11. ROLLBACK COMPLETENESS (v0.5.1 hotfix).
- *     v0.5 added snapshot/restore of `mes`, `mes_text`, `swipes`, and
- *     `is_edited` when persist fails — but forgot that `savedRange`
- *     still references the OLD DOM nodes. After `$mesText.html(...)`
- *     rollback, `savedRange` points to detached nodes. If the user
- *     then clicks Save again, `applyRangeEdit(savedRange, ...)` runs
- *     against an invalid Range and silently does nothing (or worse,
- *     inserts text into a detached subtree).
- *
- *     v0.5.1 invalidates `savedRange` and hides the toolbar/popup on
- *     rollback, so the user is forced to re-select before trying
- *     again. The popup also does NOT stay open with stale state.
- *
- * 12. FOCUS CONSISTENCY (v0.5.1 hotfix).
- *     v0.5 only restored focus on Cancel — not on Save. After Save,
- *     focus was lost (left on a detached textarea). v0.5.1 restores
- *     focus on BOTH paths consistently.
- *
- * 13. ARIA-MODAL HONESTY (v0.5.1 hotfix).
- *     `aria-modal="true"` promises screen readers that nothing
- *     outside the dialog is interactive. v0.5 left the toolbar
- *     visible and clickable behind the popup — an a11y violation.
- *     v0.5.1 hides the toolbar while the popup is open.
- *
- * 14. UNDO UX (v0.5.1 hotfix).
- *     v0.5 fired a toastr on every delete, which stacks up when the
- *     user deletes repeatedly. v0.5.1 uses a single ephemeral toast
- *     with a shorter message and replaces any previous one.
- *
- * 15. SOURCE-OF-TRUTH EDITS (v0.5.2).
- *     v0.5.1 wrote the RENDERED html (`$mesText.html()`) into `message.mes`,
- *     which holds raw markdown. That baked `<em>`, `<p>`, `<br>` and
- *     substituted macros into the chat file and the prompt. v0.5.2 edits
- *     the raw `mes` string instead (exact unique match, see util.js) and
- *     refuses ambiguous selections. `mes_text` is not a real field and is
- *     no longer written.
- *
- * 16. CAPSULE + SHEET UI (v0.6.0).
- *     Toolbar is one labelled capsule with a tail that points at the
- *     selection (`--qe-tail-x`, `.is-above` when flipped). On narrow
- *     screens (<= 600px) the edit popup becomes a bottom sheet pinned
- *     to the bottom of the VISUAL viewport, so it rides above the soft
- *     keyboard; `.is-sheet` is set by JS so CSS and JS agree on the
- *     breakpoint. Colours come from ST theme variables (style.css).
+ * Root causes worth remembering when editing this file:
+ *  - Visibility is a `.is-visible` class, never jQuery .show(): an inline
+ *    display would break the flex row.
+ *  - Buttons act on `pointerdown` (mousedown fallback): on touch, `click`
+ *    arrives after `selectionchange` already wiped the saved Range.
+ *    `lastUiInteraction` gives selectionchange a 500ms grace window.
+ *  - Never close the edit popup on resize/scroll/selectionchange: the soft
+ *    keyboard fires resize and would kill it while typing.
+ *  - `mesid` equals the index into `chat[]`; message objects have no `mesid`.
+ *  - Edits replace text in raw `message.mes`, never rendered HTML; ambiguous
+ *    selections are refused.
+ *  - After a rollback `savedRange` points at detached nodes: invalidate it
+ *    and hide the UI.
+ *  - Touch screens: native selection handles hang ~20px under the line, so
+ *    the capsule keeps a larger gap there. Narrow screens (<=600px) get a
+ *    bottom sheet pinned to the visual viewport (rides above the keyboard).
  */
 
 import { extension_settings, getContext } from "../../../extensions.js";
@@ -136,7 +28,6 @@ import { saveSettingsDebounced, saveChatDebounced } from "../../../../script.js"
 import { replaceOnce } from "./util.js";
 
 const extensionName = "Dunno";
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 
 const defaultSettings = {
     enabled: true
@@ -189,12 +80,10 @@ function loadSettings() {
     const merged = { ...defaultSettings, ...extension_settings[extensionName] };
     extension_settings[extensionName] = merged;
 
-    $("#quick_edit_enabled").prop("checked", merged.enabled);
     console.log(`[${extensionName}] Settings loaded:`, merged);
 }
 
-function onEnabledChange(event) {
-    const value = Boolean($(event.target).prop("checked"));
+function setEnabled(value) {
     extension_settings[extensionName].enabled = value;
     saveSettingsDebounced();
     console.log(`[${extensionName}] enabled =`, value);
@@ -203,6 +92,38 @@ function onEnabledChange(event) {
     } else {
         stopListening();
     }
+    updateMenuItem();
+}
+
+/** On/off toggle lives in the burger (options) menu. */
+function addMenuItem() {
+    if ($("#qe-menu-toggle").length) return;
+
+    const $item = $(`
+        <a id="qe-menu-toggle" role="menuitem">
+            <i class="fa-lg fa-solid fa-pen-to-square"></i>
+            <span></span>
+        </a>
+    `);
+    const $anchor = $("#option_toggle_logprobs");
+    const $host = $("#options .options-content");
+
+    if ($anchor.length) {
+        $anchor.after($item);
+    } else if ($host.length) {
+        $host.append($item);
+    } else {
+        console.warn(`[${extensionName}] Options menu not found; no on/off toggle available`);
+        return;
+    }
+
+    $item.on("click", () => setEnabled(extension_settings[extensionName].enabled === false));
+    updateMenuItem();
+}
+
+function updateMenuItem() {
+    const on = extension_settings[extensionName]?.enabled !== false;
+    $("#qe-menu-toggle").toggleClass("qe-off", !on).find("span").text(`Quick Edit: ${on ? "On" : "Off"}`);
 }
 
 /* =============================================================
@@ -396,18 +317,23 @@ function handleSelection() {
 function positionToolbar(range) {
     if (!$toolbar || !range) return;
 
-    const rect = range.getBoundingClientRect();
+    // Anchor to the LAST line of the selection: that is where the native
+    // handles hang. On touch screens they sit ~20px below the line, so keep
+    // a bigger gap there (the capsule stacks: other pill above, text, us below).
+    const rects = range.getClientRects();
+    const rect = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
     const vp = getViewportMetrics();
     const tbW = toolbarWidth;
     const tbH = toolbarHeight;
-    const gap = 12; // room for the tail
+    const touch = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+    const gap = touch ? 28 : 10;
     const minX = vp.left + 4;
     const minY = vp.top + 4;
     const maxX = vp.left + vp.width - tbW - 4;
     const maxY = vp.top + vp.height - tbH - 4;
 
     let top = vp.top + rect.bottom + gap;
-    let left = vp.left + rect.left + (rect.width / 2) - (tbW / 2);
+    let left = vp.left + rect.left; // left edge sits under the selection start
     let above = false;
 
     if (top + tbH > vp.top + vp.height - 4) {
@@ -421,7 +347,7 @@ function positionToolbar(range) {
     // Point the tail at the selection's centre, kept inside the
     // capsule's rounded ends.
     const centerX = vp.left + rect.left + (rect.width / 2);
-    const tailX = Math.max(24, Math.min(centerX - left, tbW - 24));
+    const tailX = Math.max(18, Math.min(centerX - left, tbW - 18));
     $toolbar[0].style.setProperty("--qe-tail-x", `${tailX}px`);
 
     $toolbar.toggleClass("is-above", above).css({ top: `${top}px`, left: `${left}px` });
@@ -1126,12 +1052,9 @@ jQuery(async () => {
     console.log(`[${extensionName}] Loading...`);
 
     try {
-        const settingsHtml = await $.get(`${extensionFolderPath}/example.html`);
-        $("#extensions_settings2").append(settingsHtml);
-
-        $("#quick_edit_enabled").on("input", onEnabledChange);
         loadSettings();
         createUI();
+        addMenuItem();
 
         if (extension_settings[extensionName]?.enabled !== false) {
             startListening();

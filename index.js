@@ -121,6 +121,14 @@
  *     the raw `mes` string instead (exact unique match, see util.js) and
  *     refuses ambiguous selections. `mes_text` is not a real field and is
  *     no longer written.
+ *
+ * 16. CAPSULE + SHEET UI (v0.6.0).
+ *     Toolbar is one labelled capsule with a tail that points at the
+ *     selection (`--qe-tail-x`, `.is-above` when flipped). On narrow
+ *     screens (<= 600px) the edit popup becomes a bottom sheet pinned
+ *     to the bottom of the VISUAL viewport, so it rides above the soft
+ *     keyboard; `.is-sheet` is set by JS so CSS and JS agree on the
+ *     breakpoint. Colours come from ST theme variables (style.css).
  */
 
 import { extension_settings, getContext } from "../../../extensions.js";
@@ -169,6 +177,8 @@ const DELETE_UNDO_MS = 5000;
 /** shorter undo toast timeout — toast clears before the undo window
  *  expires so it doesn't sit there taunting the user. */
 const UNDO_TOAST_MS = 4000;
+/** viewport width (px) at or below which the edit popup is a bottom sheet */
+const SHEET_MAX_WIDTH = 600;
 
 /* =============================================================
    SETTINGS
@@ -206,22 +216,25 @@ function createUI() {
         <div id="qe-toolbar" role="toolbar" aria-label="Quick edit toolbar">
             <button id="qe-edit-btn" class="qe-btn" type="button"
                     title="Edit selected text" aria-label="Edit selected text">
-                <i class="fa-solid fa-pen"></i>
+                <i class="fa-solid fa-pen" aria-hidden="true"></i><span>Edit</span>
             </button>
+            <span class="qe-sep" aria-hidden="true"></span>
             <button id="qe-delete-btn" class="qe-btn" type="button"
                     title="Delete selected text" aria-label="Delete selected text">
-                <i class="fa-solid fa-trash"></i>
+                <i class="fa-solid fa-trash" aria-hidden="true"></i><span>Delete</span>
             </button>
         </div>
     `);
 
     $editPopup = $(`
         <div id="qe-edit-popup" role="dialog" aria-modal="true" aria-label="Edit selected text">
-            <textarea id="qe-edit-textarea"
+            <div class="qe-label">Selected text</div>
+            <div id="qe-original"></div>
+            <textarea id="qe-edit-textarea" aria-label="Edited text"
                       placeholder="Edit selected text..."></textarea>
             <div id="qe-popup-buttons">
                 <button id="qe-cancel-btn" type="button">Cancel</button>
-                <button id="qe-save-btn" type="button">Save</button>
+                <button id="qe-save-btn" type="button">Save changes</button>
             </div>
         </div>
     `);
@@ -387,7 +400,7 @@ function positionToolbar(range) {
     const vp = getViewportMetrics();
     const tbW = toolbarWidth;
     const tbH = toolbarHeight;
-    const gap = 8;
+    const gap = 12; // room for the tail
     const minX = vp.left + 4;
     const minY = vp.top + 4;
     const maxX = vp.left + vp.width - tbW - 4;
@@ -395,15 +408,23 @@ function positionToolbar(range) {
 
     let top = vp.top + rect.bottom + gap;
     let left = vp.left + rect.left + (rect.width / 2) - (tbW / 2);
+    let above = false;
 
     if (top + tbH > vp.top + vp.height - 4) {
         top = vp.top + rect.top - tbH - gap;
+        above = true;
     }
 
     top = Math.max(minY, Math.min(top, maxY));
     left = Math.max(minX, Math.min(left, maxX));
 
-    $toolbar.css({ top: `${top}px`, left: `${left}px` });
+    // Point the tail at the selection's centre, kept inside the
+    // capsule's rounded ends.
+    const centerX = vp.left + rect.left + (rect.width / 2);
+    const tailX = Math.max(24, Math.min(centerX - left, tbW - 24));
+    $toolbar[0].style.setProperty("--qe-tail-x", `${tailX}px`);
+
+    $toolbar.toggleClass("is-above", above).css({ top: `${top}px`, left: `${left}px` });
 }
 
 /**
@@ -729,6 +750,7 @@ function onEditClick() {
 
     const $textarea = $("#qe-edit-textarea");
     $textarea.val(savedRange.toString());
+    $("#qe-original").text(savedRange.toString());
 
     positionEditPopup();
 
@@ -862,11 +884,24 @@ function positionEditPopup() {
     if (!$editPopup) return;
     const vp = getViewportMetrics();
     const gap = 8;
+    const sheet = vp.width <= SHEET_MAX_WIDTH;
 
-    $editPopup.addClass("is-visible");
+    $editPopup
+        .toggleClass("is-sheet", sheet)
+        .css("width", sheet ? `${vp.width - 16}px` : "")
+        .addClass("is-visible");
 
     const popW = $editPopup.outerWidth() || 320;
     const popH = $editPopup.outerHeight() || 180;
+
+    if (sheet) {
+        // Pin to the bottom of the VISUAL viewport (above the keyboard).
+        $editPopup.css({
+            top: `${Math.max(vp.top + 8, vp.top + vp.height - popH - 8)}px`,
+            left: `${vp.left + 8}px`
+        });
+        return;
+    }
 
     // The toolbar may have been hidden (aria-modal honesty in
     // onEditClick). Use its last-known rect if available, otherwise
@@ -999,6 +1034,10 @@ function repositionPopupForViewport() {
     if (!$editPopup || !$editPopup.hasClass("is-visible")) return;
 
     const vp = getViewportMetrics();
+    if (vp.width <= SHEET_MAX_WIDTH) {
+        positionEditPopup(); // re-pin the sheet above the keyboard
+        return;
+    }
     const rect = $editPopup[0].getBoundingClientRect();
 
     if (
@@ -1058,6 +1097,7 @@ function startListening() {
     window.addEventListener("resize", onViewportChange);
     if (window.visualViewport) {
         window.visualViewport.addEventListener("resize", onViewportChange);
+        window.visualViewport.addEventListener("scroll", onViewportChange);
     }
 }
 
@@ -1069,6 +1109,7 @@ function stopListening() {
     window.removeEventListener("resize", onViewportChange);
     if (window.visualViewport) {
         window.visualViewport.removeEventListener("resize", onViewportChange);
+        window.visualViewport.removeEventListener("scroll", onViewportChange);
     }
     document.removeEventListener("selectionchange", onSelectionChangeHandler);
     clearTimeout(selectionTimer);

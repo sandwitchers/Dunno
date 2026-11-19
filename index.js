@@ -25,6 +25,18 @@
  *    when there is no room below), so it never covers the text the user
  *    is holding to copy. Left-of-selection was tried in v0.7.1 and made
  *    holding a drag selection hard, so v0.8.0 puts it back below.
+ *  - Matching is line-break tolerant (v0.8.1): a selection spanning
+ *    two rendered paragraphs comes back with one `\n` between them,
+ *    while the raw source has `\n\n`. `locateEdit` collapses break
+ *    runs on both sides before matching and maps the hit back to raw
+ *    offsets. When the edit keeps the same line count, the original
+ *    `\n\n` gap is preserved in the replacement instead of collapsing
+ *    to the textarea's `\n` (ST renders a single `\n` as `<br>`,
+ *    `simpleLineBreaks: true`, so the gap would shrink otherwise).
+ *  - Context is gathered per block (v0.8.1): a cross-paragraph
+ *    selection has start and end in different blocks, so `before`
+ *    (start block) and `after` (end block) are read in separate
+ *    try/catch halves instead of one shared one that threw away both.
  *  - Streaming is a global signal, not a message flag: message objects
  *    have NO `.streaming` property. The real signal is
  *    `getContext().streamingProcessor` (null when idle).
@@ -46,6 +58,7 @@ import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, saveChatDebounced } from "../../../../script.js";
 import {
     locateEdit,
+    preserveNewlineRuns,
     captureMessageState,
     restoreMessageState,
     writeCurrentSwipe,
@@ -851,22 +864,40 @@ function getCurrentMessageState() {
  * then behaves like an exact-match search.
  */
 function getSelectionContext(range) {
+    // before and after are gathered independently, from their own
+    // blocks. A selection spanning two paragraphs (dialogue <p> +
+    // narration <p>) has its start and end in DIFFERENT blocks: one
+    // shared try/catch used to throw on the after half (Range
+    // boundary points in the wrong order) and discard the before half
+    // with it, so multi-paragraph selections located with no context
+    // at all. Each half failing now costs only that half.
+    const readRange = (startNode, startOffset, endNode, endOffset) => {
+        const r = document.createRange();
+        r.setStart(startNode, startOffset);
+        r.setEnd(endNode, endOffset);
+        return r.toString();
+    };
+    let before = "";
     try {
         const startEl = normalizeNode(range.startContainer);
-        const blockEl = startEl?.closest("p, div, li, h1, h2, h3, h4, blockquote, pre") || null;
-        if (!blockEl) return { before: "", after: "" };
-        const readRange = (startNode, startOffset, endNode, endOffset) => {
-            const r = document.createRange();
-            r.setStart(startNode, startOffset);
-            r.setEnd(endNode, endOffset);
-            return r.toString();
-        };
-        const before = readRange(blockEl, 0, range.startContainer, range.startOffset).slice(-100);
-        const after = readRange(range.endContainer, range.endOffset, blockEl, blockEl.childNodes.length).slice(0, 100);
-        return { before, after };
+        const startBlock = startEl?.closest("p, div, li, h1, h2, h3, h4, blockquote, pre") || null;
+        if (startBlock) {
+            before = readRange(startBlock, 0, range.startContainer, range.startOffset).slice(-100);
+        }
     } catch (e) {
-        return { before: "", after: "" };
+        before = "";
     }
+    let after = "";
+    try {
+        const endEl = normalizeNode(range.endContainer);
+        const endBlock = endEl?.closest("p, div, li, h1, h2, h3, h4, blockquote, pre") || null;
+        if (endBlock) {
+            after = readRange(range.endContainer, range.endOffset, endBlock, endBlock.childNodes.length).slice(0, 100);
+        }
+    } catch (e) {
+        after = "";
+    }
+    return { before, after };
 }
 
 /**
@@ -890,7 +921,11 @@ function resolveRawEdit(selectedText, newText) {
         notify("Couldn't find that text in the message source (formatting?). Select a plainer phrase.", "warning");
         return null;
     }
-    return source.slice(0, loc.start) + newText + source.slice(loc.end);
+    // Keep the original paragraph gaps when the edit keeps the same
+    // line count (see preserveNewlineRuns): a \n\n in the raw span
+    // stays \n\n instead of collapsing to the \n the textarea holds.
+    const replacement = preserveNewlineRuns(source.slice(loc.start, loc.end), newText);
+    return source.slice(0, loc.start) + replacement + source.slice(loc.end);
 }
 
 function clearSelection() {

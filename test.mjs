@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
     replaceOnce,
     locateEdit,
+    collapseNewlines,
+    preserveNewlineRuns,
     isValidSwipeIndex,
     writeCurrentSwipe,
     captureMessageState,
@@ -58,6 +60,61 @@ assert.deepEqual(locateEdit("abc", "", "", ""), { error: "notfound" });
     const src = "Dia *pemalas* sekali.";
     const loc = locateEdit(src, "pemalas", "Dia *", " sekali.");
     assert.deepEqual(loc, { start: 5, end: 12 });
+}
+// --- collapseNewlines: runs map back to raw offsets ---
+{
+    const { text, map } = collapseNewlines("a\n\nb\r\n\r\nc\rd");
+    assert.equal(text, "a\nb\nc\nd");
+    assert.deepEqual(map, [0, 1, 3, 4, 8, 9, 10, 11]);
+    assert.equal("a\n\nb\r\n\r\nc\nd".slice(map[2], map[3]), "b");
+}
+// --- locateEdit v0.8.1: the screenshot bug. Selection spans two rendered
+// paragraphs, so it has ONE \n at the break; raw has \n\n. ---
+{
+    const raw = "\"Oi, John! Kau tidur lagi di sini? Dasar bocah ngentot!\"\n\nLi Wei menendang kerikil kecil ke arah kakimu. Ia mendengus, lalu meludah ke samping.\n\nIa menunggumu bereaksi, tampak senang melihatmu dalam kondisi linglung.";
+    const selected = "Dasar bocah ngentot!\"\nLi Wei menendang kerikil kecil ke arah kakimu. Ia mendengus, lalu meludah ke samping.";
+    const loc = locateEdit(raw, selected, "\"Oi, John! Kau tidur lagi di sini? ", "");
+    // Span starts at "Dasar" (offset 35) and ends after "samping." — the
+    // raw span INCLUDES the \n\n break, so replacing it keeps the gap.
+    assert.equal(raw.slice(loc.start, loc.end), "Dasar bocah ngentot!\"\n\nLi Wei menendang kerikil kecil ke arah kakimu. Ia mendengus, lalu meludah ke samping.");
+    assert.equal(loc.start, 35);
+    // The user's edit: same lines, one line appended. Line count differs
+    // (3 breaks vs 1 run), so preserveNewlineRuns falls back to the
+    // user's text as-is and the \n\n gap becomes a single \n — ST still
+    // renders it as a line break (simpleLineBreaks), just no blank gap.
+    const edited = "Dasar bocah ngentot!\"\nLi Wei menendang kerikil kecil ke arah kakimu.\nIa mendengus, lalu meludah ke samping\n*hoeek cuihh*";
+    const next = raw.slice(0, loc.start) + preserveNewlineRuns(raw.slice(loc.start, loc.end), edited) + raw.slice(loc.end);
+    assert.equal(next, "\"Oi, John! Kau tidur lagi di sini? Dasar bocah ngentot!\"\nLi Wei menendang kerikil kecil ke arah kakimu.\nIa mendengus, lalu meludah ke samping\n*hoeek cuihh*\n\nIa menunggumu bereaksi, tampak senang melihatmu dalam kondisi linglung.");
+}
+// Same screenshot case, but with NO context at all (the old
+// getSelectionContext threw both halves away on cross-block selections).
+{
+    const raw = "Satu.\n\nDua kalimat sama.\n\nTiga.";
+    assert.deepEqual(locateEdit(raw, "Satu.\nDua kalimat sama.", "", ""), { start: 0, end: 24 });
+}
+// --- locateEdit: ambiguous across paragraphs, context disambiguates ---
+{
+    const raw = "Dia bilang pemalas sekali.\n\nDia bilang pemalas sekali.\n\nAkhir.";
+    // before from the FIRST paragraph's start -> first copy.
+    assert.deepEqual(locateEdit(raw, "pemalas", "Dia bilang ", " sekali.\n\nDia bilang"), { start: 11, end: 18 });
+    // after from the SECOND paragraph's tail -> second copy.
+    assert.deepEqual(locateEdit(raw, "pemalas", "Dia bilang pemalas sekali.\n\nDia bilang ", " sekali.\n\nAkhir."), { start: 39, end: 46 });
+}
+// --- locateEdit: \r\n raw (imported chat) matches a \n selection ---
+{
+    const raw = "Satu.\r\n\r\nDua.";
+    assert.deepEqual(locateEdit(raw, "Satu.\nDua.", "", ""), { start: 0, end: 13 });
+}
+// --- preserveNewlineRuns ---
+{
+    // Same line count: the \n\n gap survives the edit.
+    assert.equal(preserveNewlineRuns("a\n\nb", "a\nB"), "a\n\nB");
+    // Different line count (user added a line): their text wins as-is.
+    assert.equal(preserveNewlineRuns("a\n\nb", "a\nB\nc"), "a\nB\nc");
+    // No breaks in the span: unchanged.
+    assert.equal(preserveNewlineRuns("abc", "aXc"), "aXc");
+    // \r\n run preserved.
+    assert.equal(preserveNewlineRuns("a\r\n\r\nb", "a\nB"), "a\r\n\r\nB");
 }
 
 // --- swipe helpers: stale swipe_id must not create properties or holes ---

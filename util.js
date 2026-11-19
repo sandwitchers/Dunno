@@ -60,11 +60,58 @@ function findOccurrences(source, needle, selectedStart, selectedLength, hidden) 
 }
 
 /**
+ * Collapse every run of line breaks (`\n\n`, `\r\n`, `\r`) into a single
+ * `\n`, keeping an offset map back to the original text.
+ *
+ * Why: the rendered text a user selects and the raw `mes` disagree about
+ * line breaks. A paragraph break in raw is `\n\n`, but a selection that
+ * spans two rendered `<p>` elements comes back from `Range.toString()`
+ * with a single `\n` between them. Exact matching can then never find a
+ * multi-paragraph selection (the screenshot bug: dialogue + narration
+ * in one selection always answered "notfound"). Matching happens on the
+ * collapsed text; `map` translates the hit back to raw offsets, so the
+ * replaced span still covers the original `\n\n`.
+ *
+ * `map[i]` is the source index of collapsed character `i`, and
+ * `map[text.length]` is the source length. A collapsed run's end is the
+ * next character's start (or the source end), so mapping an exclusive
+ * end offset through `map` automatically includes the whole run.
+ */
+export function collapseNewlines(text) {
+    const src = String(text ?? "");
+    let out = "";
+    const map = [];
+    let i = 0;
+    while (i < src.length) {
+        const ch = src[i];
+        if (ch === "\r" || ch === "\n") {
+            map.push(i);
+            out += "\n";
+            i++;
+            // Skip the rest of this break run: \r\n counts as one break,
+            // and so does any run of \n / \r.
+            while (i < src.length && (src[i] === "\r" || src[i] === "\n")) i++;
+        } else {
+            map.push(i);
+            out += ch;
+            i++;
+        }
+    }
+    map.push(src.length);
+    return { text: out, map };
+}
+
+/**
  * Locate `selected` inside raw `source` using rendered text around it.
  *
  * `before` / `after` are the rendered text before / after the selection
  * (from the DOM, within the selection's nearest block element). The
  * needle grows context in steps: 40, 20, 10, 5, then 0 chars each side.
+ *
+ * Matching is line-break tolerant: runs of `\n` / `\r\n` / `\r` collapse
+ * to one `\n` on both sides before matching (see `collapseNewlines`),
+ * so a selection spanning a paragraph break still matches the raw
+ * `\n\n`. Returned offsets are raw-source offsets.
  *
  * Returns `{ start, end }` — offsets of the SELECTED part in `source` —
  * or `{ error: "ambiguous" }` / `{ error: "notfound" }`.
@@ -76,20 +123,45 @@ function findOccurrences(source, needle, selectedStart, selectedLength, hidden) 
  */
 export function locateEdit(source, selected, before = "", after = "") {
     if (!selected) return { error: "notfound" };
-    const hidden = hiddenRanges(source);
+    const normSrc = collapseNewlines(source);
+    const normSel = collapseNewlines(selected).text;
+    const normBefore = collapseNewlines(before).text;
+    const normAfter = collapseNewlines(after).text;
+    const hidden = hiddenRanges(normSrc.text);
     for (const L of [40, 20, 10, 5, 0]) {
-        const pre = L === 0 ? "" : before.slice(-L);
-        const post = L === 0 ? "" : after.slice(0, L);
-        const needle = pre + selected + post;
-        const hits = findOccurrences(source, needle, pre.length, selected.length, hidden);
+        const pre = L === 0 ? "" : normBefore.slice(-L);
+        const post = L === 0 ? "" : normAfter.slice(0, L);
+        const needle = pre + normSel + post;
+        const hits = findOccurrences(normSrc.text, needle, pre.length, normSel.length, hidden);
         if (hits.length === 1) {
-            const start = hits[0] + pre.length;
-            return { start, end: start + selected.length };
+            const start = normSrc.map[hits[0] + pre.length];
+            const end = normSrc.map[hits[0] + pre.length + normSel.length];
+            return { start, end };
         }
         if (hits.length > 1) return { error: "ambiguous" };
         // 0 hits: shrink L and retry.
     }
     return { error: "notfound" };
+}
+
+/**
+ * Keep the original span's line-break runs when the replacement has the
+ * same number of line breaks. A multi-paragraph edit whose text keeps
+ * the same lines (user only changed words) must not silently turn a
+ * `\n\n` paragraph gap into a `\n` line break: ST renders a single
+ * `\n` as `<br>` (simpleLineBreaks), so the gap would shrink to a
+ * plain line break. When the counts differ (user added / removed a
+ * line), their new text wins as-is.
+ */
+export function preserveNewlineRuns(originalSpan, newText) {
+    const runs = String(originalSpan ?? "").match(/(\r\n|\r|\n)+/g) ?? [];
+    const parts = String(newText ?? "").split(/(\r\n|\r|\n)/);
+    const breaks = Math.floor(parts.length / 2);
+    if (runs.length === 0 || runs.length !== breaks) return newText;
+    for (let k = 0; k < runs.length; k++) {
+        parts[2 * k + 1] = runs[k];
+    }
+    return parts.join("");
 }
 
 /** True when `swipe_id` is a usable index into `swipes`. */

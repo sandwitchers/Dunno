@@ -42,6 +42,10 @@ Delete cannot be used while the AI is streaming, and neither can edit.
 
 ## Changelog
 
+### v0.8.1
+
+- **Multi-paragraph selections can be edited now.** A selection spanning two rendered paragraphs (dialogue + narration, like the screenshot case) used to always answer "Couldn't find that text in the message source". Two causes, both fixed: the context reader threw both halves away when start and end sat in different paragraphs, and the matcher required the selection's single `\n` to equal the raw source's `\n\n` paragraph break. Matching is now line-break tolerant (runs of `\n` / `\r\n` collapse to one `\n` for matching, then map back to raw offsets), and the context is read per block. When the edit keeps the same line count, the original `\n\n` gap is preserved in the saved text; when the user adds or removes a line, their text wins as-is (a single `\n` still renders as a line break in SillyTavern, just without the blank gap).
+
 ### v0.8.0
 
 - **Repeated words can be edited now.** The match uses the text around your selection, so a word that also appears inside a hidden `<UpdateVariable>` block no longer blocks the edit. Ambiguous and unfindable selections get separate messages.

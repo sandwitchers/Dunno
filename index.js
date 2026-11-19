@@ -1,9 +1,9 @@
 /**
  * Quick Edit — SillyTavern / TauriTavern extension
  *
- * Select text in a chat message -> a small capsule appears below the
- * selection with Edit / Delete. Edits go into the raw message source
- * (see util.js). On/off lives in the burger (options) menu.
+ * Select text in a chat message -> a small capsule appears beside the
+ * selection's first line with Edit / Delete. Edits go into the raw message
+ * source (see util.js). On/off lives in the burger (options) menu.
  *
  * Root causes worth remembering when editing this file:
  *  - Visibility is a `.is-visible` class, never jQuery .show(): an inline
@@ -18,9 +18,12 @@
  *    selections are refused.
  *  - After a rollback `savedRange` points at detached nodes: invalidate it
  *    and hide the UI.
- *  - Touch screens: native selection handles hang ~20px under the line, so
- *    the capsule keeps a larger gap there. Narrow screens (<=600px) get a
- *    bottom sheet pinned to the visual viewport (rides above the keyboard).
+ *  - Placement: the capsule sits LEFT of the selection's first line, so it
+ *    never overlaps ST's Clip/Extract pill (right side). Native touch handles
+ *    hang under the line, hence the bigger gap on coarse pointers. If there
+ *    is no room on the left it drops below the selection instead.
+ *  - Narrow screens (<=600px) get a bottom sheet pinned to the visual
+ *    viewport (rides above the keyboard).
  */
 
 import { extension_settings, getContext } from "../../../extensions.js";
@@ -49,8 +52,8 @@ let selectionTimer = null;
 /** debounce handle for viewport (resize / visualViewport) events */
 let resizeTimer = null;
 /** cached toolbar outer dimensions (measured once in createUI) */
-let toolbarWidth = 110;
-let toolbarHeight = 52;
+let toolbarWidth = 96;
+let toolbarHeight = 26;
 /** previous focus target before opening the popup */
 let previousFocusElement = null;
 /** snapshot for delete undo */
@@ -164,8 +167,8 @@ function createUI() {
 
     // Measure toolbar dimensions once while temporarily visible.
     $toolbar.css("visibility", "hidden").addClass("is-visible");
-    toolbarWidth = $toolbar.outerWidth() || 110;
-    toolbarHeight = $toolbar.outerHeight() || 52;
+    toolbarWidth = $toolbar.outerWidth() || 96;
+    toolbarHeight = $toolbar.outerHeight() || 26;
     $toolbar.removeClass("is-visible").css("visibility", "");
 
     bindQuickAction($("#qe-edit-btn"), onEditClick);
@@ -317,40 +320,30 @@ function handleSelection() {
 function positionToolbar(range) {
     if (!$toolbar || !range) return;
 
-    // Anchor to the LAST line of the selection: that is where the native
-    // handles hang. On touch screens they sit ~20px below the line, so keep
-    // a bigger gap there (the capsule stacks: other pill above, text, us below).
+    // Preferred spot: on the selection's FIRST line, just LEFT of it, so the
+    // capsule sits beside the text like [Edit Delete] [text] [Clip Extract].
     const rects = range.getClientRects();
-    const rect = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
+    const first = rects.length ? rects[0] : range.getBoundingClientRect();
+    const last = rects.length ? rects[rects.length - 1] : first;
     const vp = getViewportMetrics();
     const tbW = toolbarWidth;
     const tbH = toolbarHeight;
     const touch = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
-    const gap = touch ? 28 : 10;
     const minX = vp.left + 4;
     const minY = vp.top + 4;
-    const maxX = vp.left + vp.width - tbW - 4;
     const maxY = vp.top + vp.height - tbH - 4;
 
-    let top = vp.top + rect.bottom + gap;
-    let left = vp.left + rect.left; // left edge sits under the selection start
-    let above = false;
+    let left = vp.left + first.left - (touch ? 12 : 8) - tbW;
+    let top = vp.top + first.top + first.height / 2 - tbH / 2;
 
-    if (top + tbH > vp.top + vp.height - 4) {
-        top = vp.top + rect.top - tbH - gap;
-        above = true;
+    if (left < minX) {
+        // No room on the left (selection starts at the edge): drop below.
+        left = Math.max(minX, Math.min(vp.left + first.left, vp.left + vp.width - tbW - 4));
+        top = vp.top + last.bottom + (touch ? 28 : 10);
     }
 
     top = Math.max(minY, Math.min(top, maxY));
-    left = Math.max(minX, Math.min(left, maxX));
-
-    // Point the tail at the selection's centre, kept inside the
-    // capsule's rounded ends.
-    const centerX = vp.left + rect.left + (rect.width / 2);
-    const tailX = Math.max(18, Math.min(centerX - left, tbW - 18));
-    $toolbar[0].style.setProperty("--qe-tail-x", `${tailX}px`);
-
-    $toolbar.toggleClass("is-above", above).css({ top: `${top}px`, left: `${left}px` });
+    $toolbar.css({ top: `${top}px`, left: `${left}px` });
 }
 
 /**

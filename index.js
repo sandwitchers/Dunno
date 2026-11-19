@@ -1,9 +1,9 @@
 /**
  * Quick Edit — SillyTavern / TauriTavern extension
  *
- * Select text in a chat message -> a small capsule appears beside the
- * selection's first line with Edit / Delete. Edits go into the raw message
- * source (see util.js). On/off lives in the burger (options) menu.
+ * Select text in a chat message -> a small pill appears BELOW the
+ * selection with Edit / Delete. Edits go into the raw message source
+ * (see util.js). On/off lives in the Wand (extensions) menu.
  *
  * Root causes worth remembering when editing this file:
  *  - Visibility is a `.is-visible` class, never jQuery .show(): an inline
@@ -14,21 +14,43 @@
  *  - Never close the edit popup on resize/scroll/selectionchange: the soft
  *    keyboard fires resize and would kill it while typing.
  *  - `mesid` equals the index into `chat[]`; message objects have no `mesid`.
- *  - Edits replace text in raw `message.mes`, never rendered HTML; ambiguous
- *    selections are refused.
+ *  - Edits replace text in raw `message.mes`, never rendered HTML; the
+ *    match is located with surrounding rendered context (util.js
+ *    `locateEdit`), because the same word can appear twice in the source
+ *    — once in the story, once inside a hidden <UpdateVariable> block.
+ *    Ambiguous selections are refused; unfindable ones are refused too.
  *  - After a rollback `savedRange` points at detached nodes: invalidate it
  *    and hide the UI.
- *  - Placement: the capsule sits LEFT of the selection's first line, so it
- *    never overlaps ST's Clip/Extract pill (right side). Native touch handles
- *    hang under the line, hence the bigger gap on coarse pointers. If there
- *    is no room on the left it drops below the selection instead.
+ *  - Placement: the pill sits BELOW the selection's last line (above it
+ *    when there is no room below), so it never covers the text the user
+ *    is holding to copy. Left-of-selection was tried in v0.7.1 and made
+ *    holding a drag selection hard, so v0.8.0 puts it back below.
+ *  - Streaming is a global signal, not a message flag: message objects
+ *    have NO `.streaming` property. The real signal is
+ *    `getContext().streamingProcessor` (null when idle).
+ *  - `saveChatDebounced()` cannot report failure: the debounced save
+ *    runs later and swallows errors, so the rollback in
+ *    `saveMessageChanges` only covers synchronous errors. A failed save
+ *    on the server will NOT roll back; do not claim otherwise.
+ *  - Client rects and `position: fixed` share layout-viewport
+ *    coordinates. Never add `visualViewport.offsetLeft/Top` to a
+ *    rect-derived position — it double-counts under pinch-zoom. The
+ *    offset belongs only in clamps to the visible area and in the
+ *    bottom-sheet pin, which must follow the visual viewport above
+ *    the keyboard.
  *  - Narrow screens (<=600px) get a bottom sheet pinned to the visual
  *    viewport (rides above the keyboard).
  */
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, saveChatDebounced } from "../../../../script.js";
-import { replaceOnce } from "./util.js";
+import {
+    locateEdit,
+    captureMessageState,
+    restoreMessageState,
+    writeCurrentSwipe,
+    isUndoValid,
+} from "./util.js";
 
 const extensionName = "Dunno";
 
@@ -98,9 +120,19 @@ function setEnabled(value) {
     updateMenuItem();
 }
 
-/** On/off toggle lives in the burger (options) menu. */
+/**
+ * On/off toggle lives in the Wand (extensions) menu: `#extensionsMenu`
+ * is SillyTavern's dropdown under the wand button in the send form.
+ * ST shows the wand button only while the menu has a visible child,
+ * so our item being there is what makes the button appear.
+ * Returns true when the item exists, false when the menu is not in
+ * the DOM yet (the caller retries).
+ */
 function addMenuItem() {
-    if ($("#qe-menu-toggle").length) return;
+    if ($("#qe-menu-toggle").length) return true;
+
+    const $host = $("#extensionsMenu");
+    if (!$host.length) return false;
 
     const $item = $(`
         <a id="qe-menu-toggle" role="menuitem">
@@ -108,20 +140,24 @@ function addMenuItem() {
             <span></span>
         </a>
     `);
-    const $anchor = $("#option_toggle_logprobs");
-    const $host = $("#options .options-content");
-
-    if ($anchor.length) {
-        $anchor.after($item);
-    } else if ($host.length) {
-        $host.append($item);
-    } else {
-        console.warn(`[${extensionName}] Options menu not found; no on/off toggle available`);
-        return;
-    }
+    $host.append($item);
 
     $item.on("click", () => setEnabled(extension_settings[extensionName].enabled === false));
     updateMenuItem();
+    return true;
+}
+
+/** Retry the Wand menu item: the menu is built by ST core and may
+ *  not exist yet when this extension loads. */
+let menuRetryCount = 0;
+function tryAddMenuItem() {
+    if (addMenuItem()) return;
+    menuRetryCount++;
+    if (menuRetryCount >= 10) {
+        console.warn(`[${extensionName}] Wand menu not found; no on/off toggle available`);
+        return;
+    }
+    setTimeout(tryAddMenuItem, 500);
 }
 
 function updateMenuItem() {
@@ -200,11 +236,14 @@ function createUI() {
         if (!focusables.length) return;
 
         const currentIndex = focusables.index(document.activeElement);
-        if (currentIndex === -1) return;
-
-        const nextIndex = e.shiftKey
-            ? (currentIndex - 1 + focusables.length) % focusables.length
-            : (currentIndex + 1) % focusables.length;
+        // Focus escaped the popup (e.g. a click outside the focusables):
+        // pull it back to the first (Tab) or last (Shift+Tab) control
+        // instead of letting Tab leave the modal dialog.
+        const nextIndex = currentIndex === -1
+            ? (e.shiftKey ? focusables.length - 1 : 0)
+            : e.shiftKey
+                ? (currentIndex - 1 + focusables.length) % focusables.length
+                : (currentIndex + 1) % focusables.length;
 
         e.preventDefault();
         focusables.eq(nextIndex).trigger("focus");
@@ -313,36 +352,45 @@ function handleSelection() {
         return;
     }
 
-    positionToolbar(savedRange);
+    // Show first: positionToolbar re-measures the pill while visible.
     $toolbar.addClass("is-visible");
+    positionToolbar(savedRange);
 }
 
 function positionToolbar(range) {
     if (!$toolbar || !range) return;
 
-    // Preferred spot: on the selection's FIRST line, just LEFT of it, so the
-    // capsule sits beside the text like [Edit Delete] [text] [Clip Extract].
+    // Below the selection's LAST line: that is where the native touch
+    // handles hang, and the pill never covers the text the user is
+    // holding to copy. Flips above when there is no room below.
+    // Re-measure here (the toolbar is visible by now): a theme or font
+    // change after load would leave the cached size stale.
+    toolbarWidth = $toolbar.outerWidth() || toolbarWidth;
+    toolbarHeight = $toolbar.outerHeight() || toolbarHeight;
+
     const rects = range.getClientRects();
-    const first = rects.length ? rects[0] : range.getBoundingClientRect();
-    const last = rects.length ? rects[rects.length - 1] : first;
+    const rect = rects.length ? rects[rects.length - 1] : range.getBoundingClientRect();
     const vp = getViewportMetrics();
     const tbW = toolbarWidth;
     const tbH = toolbarHeight;
     const touch = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+    const gap = touch ? 28 : 10;
     const minX = vp.left + 4;
     const minY = vp.top + 4;
+    const maxX = vp.left + vp.width - tbW - 4;
     const maxY = vp.top + vp.height - tbH - 4;
 
-    let left = vp.left + first.left - (touch ? 12 : 8) - tbW;
-    let top = vp.top + first.top + first.height / 2 - tbH / 2;
+    // Rect values and position:fixed share layout-viewport coordinates:
+    // no vp.left/vp.top here, or the pill double-counts under pinch-zoom.
+    let top = rect.bottom + gap;
+    let left = rect.left;
 
-    if (left < minX) {
-        // No room on the left (selection starts at the edge): drop below.
-        left = Math.max(minX, Math.min(vp.left + first.left, vp.left + vp.width - tbW - 4));
-        top = vp.top + last.bottom + (touch ? 28 : 10);
+    if (top + tbH > vp.top + vp.height - 4) {
+        top = rect.top - tbH - gap;
     }
 
     top = Math.max(minY, Math.min(top, maxY));
+    left = Math.max(minX, Math.min(left, maxX));
     $toolbar.css({ top: `${top}px`, left: `${left}px` });
 }
 
@@ -370,40 +418,8 @@ function isSelectionBoundToCurrentMessage() {
     return !!mesNode && !!ancestor && mesNode.contains(ancestor);
 }
 
-function captureMessageState(message) {
-    const swipeIndex = typeof message?.swipe_id === "number" ? message.swipe_id : null;
-    const swipeHtml = (
-        Array.isArray(message?.swipes) &&
-        swipeIndex !== null &&
-        swipeIndex >= 0 &&
-        swipeIndex < message.swipes.length
-    ) ? message.swipes[swipeIndex] : null;
-
-    return {
-        mes: message?.mes ?? "",
-        is_edited: Boolean(message?.is_edited),
-        swipe_id: swipeIndex,
-        swipe_html: swipeHtml
-    };
-}
-
-function restoreMessageState(message, snapshot) {
-    if (!message || !snapshot) return;
-
-    message.mes = snapshot.mes;
-    message.is_edited = snapshot.is_edited;
-
-    if (
-        Array.isArray(message.swipes) &&
-        typeof snapshot.swipe_id === "number" &&
-        snapshot.swipe_id >= 0 &&
-        snapshot.swipe_id < message.swipes.length &&
-        snapshot.swipe_html !== null &&
-        snapshot.swipe_html !== undefined
-    ) {
-        message.swipes[snapshot.swipe_id] = snapshot.swipe_html;
-    }
-}
+/* captureMessageState / restoreMessageState live in util.js now,
+   so the tests can cover them (they are pure: no DOM, no ST). */
 
 function clearDeleteUndo() {
     if (lastDeleteUndoTimer) {
@@ -419,12 +435,16 @@ function clearDeleteUndo() {
     }
 }
 
-function registerDeleteUndo(idx, snapshot) {
+function registerDeleteUndo(idx, snapshot, expectedMes) {
     clearDeleteUndo();
+    // expectedMes is the message text right after the delete. Undo
+    // refuses later if the message no longer matches it (see
+    // isUndoValid in util.js): the index alone cannot tell whether
+    // this is still the same message.
     lastDeletedSnapshot = {
         idx,
         snapshot,
-        createdAt: Date.now()
+        expectedMes
     };
     lastDeleteUndoTimer = setTimeout(() => {
         clearDeleteUndo();
@@ -463,17 +483,25 @@ function undoLastDelete() {
         return false;
     }
 
-    restoreMessageState(message, snapshot);
-
-    const mesEl = $("#chat .mes").eq(idx);
-    const $mesText = mesEl.find(".mes_text");
-    if ($mesText.length) {
-        $mesText.html(snapshot.mes);
+    // The index alone cannot prove this is still the same message:
+    // refuse when the text changed since the delete instead of
+    // overwriting whatever now sits at this index.
+    if (!isUndoValid(lastDeletedSnapshot, message)) {
+        notify("That message changed since the delete, so undo is no longer available.", "warning");
+        clearDeleteUndo();
+        return false;
     }
 
+    restoreMessageState(message, snapshot);
+
+    // Re-render from the restored data. Never write snapshot.mes into
+    // the DOM with .html(): it is raw markdown source, not rendered
+    // HTML, and any tag inside it would be parsed as HTML.
+    let rendered = false;
     if (typeof context.updateMessageBlock === "function") {
         try {
             context.updateMessageBlock(idx, message);
+            rendered = true;
         } catch (e) {
             console.warn(`[${extensionName}] updateMessageBlock failed during undo (non-fatal):`, e);
         }
@@ -484,7 +512,10 @@ function undoLastDelete() {
     }
 
     clearDeleteUndo();
-    notify("Delete undone.", "success");
+    notify(
+        rendered ? "Delete undone." : "Delete undone, but the message on screen is stale. Reload the chat to refresh.",
+        rendered ? "success" : "warning"
+    );
     return true;
 }
 
@@ -499,7 +530,10 @@ function resolveMessageIndex(mesIdAttr, chat, mesEl) {
         return domIdx;
     }
 
-    return chat.findIndex(m => String(m?.mesid) === String(mesIdAttr));
+    // No further fallback: message objects have no `mesid` field (the
+    // DOM `mesid` is the array index), so a findIndex on it could
+    // never match.
+    return -1;
 }
 
 function applyRangeEdit(range, newText) {
@@ -589,9 +623,7 @@ function saveMessageChanges({ previousState = null, action = "edit", nextMes } =
         message.mes = nextMes;
         message.is_edited = true;
 
-        if (Array.isArray(message.swipes) && typeof message.swipe_id === "number") {
-            message.swipes[message.swipe_id] = nextMes;
-        }
+        writeCurrentSwipe(message, nextMes);
 
         if (typeof context.updateMessageBlock === "function") {
             try {
@@ -608,7 +640,7 @@ function saveMessageChanges({ previousState = null, action = "edit", nextMes } =
         }
 
         if (action === "delete") {
-            registerDeleteUndo(idx, previousSnapshot);
+            registerDeleteUndo(idx, previousSnapshot, nextMes);
         } else {
             clearDeleteUndo();
         }
@@ -619,15 +651,20 @@ function saveMessageChanges({ previousState = null, action = "edit", nextMes } =
         );
         return true;
     } catch (e) {
-        console.error(`[${extensionName}] Persist failed, rolling back:`, e);
+        // This only runs on a SYNCHRONOUS error (bad state, a throw
+        // from the lines above). saveChatDebounced() cannot report an
+        // async save failure, so a failed save on the server does NOT
+        // reach this rollback — do not claim otherwise.
+        console.error(`[${extensionName}] Edit failed, rolling back:`, e);
         restoreMessageState(message, previousSnapshot);
-        if ($mesText.length) {
-            $mesText.html(previousSnapshot.mes);
-        }
 
+        // Never write the snapshot into the DOM with .html(): it is raw
+        // markdown source, not rendered HTML. Re-render from data.
+        let rendered = false;
         if (typeof context.updateMessageBlock === "function") {
             try {
                 context.updateMessageBlock(idx, message);
+                rendered = true;
             } catch (rollbackError) {
                 console.warn(`[${extensionName}] rollback updateMessageBlock failed:`, rollbackError);
             }
@@ -641,9 +678,26 @@ function saveMessageChanges({ previousState = null, action = "edit", nextMes } =
             }
         }
 
-        notify("The edit could not be saved and was rolled back.", "warning");
+        notify(
+            rendered
+                ? "The edit could not be saved and was rolled back."
+                : "The edit could not be saved and was rolled back. Reload the chat to refresh.",
+            "warning"
+        );
         return false;
     }
+}
+
+/**
+ * True while the AI is streaming a reply. Streaming is a GLOBAL
+ * signal: message objects have NO `.streaming` property, so the old
+ * `chat[idx].streaming` check never fired. The real signal is
+ * `getContext().streamingProcessor` (null when idle).
+ */
+function isStreaming() {
+    const ctx = getContext();
+    const sp = ctx?.streamingProcessor;
+    return !!sp && !sp.isFinished && !sp.isStopped;
 }
 
 function onEditClick() {
@@ -653,15 +707,10 @@ function onEditClick() {
         return;
     }
 
-    const mesId = $(currentMesEl).attr("mesid");
-    const idx = parseInt(mesId, 10);
-    const ctx = getContext();
-    if (!isNaN(idx) && ctx?.chat?.[idx]?.streaming) {
+    if (isStreaming()) {
         notify("Cannot edit a message that is still streaming", "warning");
         return;
     }
-
-    clearDeleteUndo();
 
     // Capture focus BEFORE opening the popup so we can restore it on
     // both Save and Cancel paths (v0.5.1 consistency fix).
@@ -692,8 +741,18 @@ function onEditSave() {
         return;
     }
 
+    // Re-check here, not just on Edit click: the stream may have
+    // started while the popup was open.
+    if (isStreaming()) {
+        notify("Cannot edit a message that is still streaming", "warning");
+        return;
+    }
+
     const previousState = getCurrentMessageState();
-    if (!previousState) return;
+    if (!previousState) {
+        notify("That message is no longer available.", "warning");
+        return;
+    }
 
     const newText = String($("#qe-edit-textarea").val() ?? "");
     const nextMes = resolveRawEdit(savedRange.toString(), newText);
@@ -706,8 +765,8 @@ function onEditSave() {
     if (!saveMessageChanges({ previousState, action: "edit", nextMes })) {
         // Persist failed and was rolled back. The DOM has been
         // restored to its pre-edit state, which means `savedRange`
-        // now references DETACHED nodes (the rollback did
-        // `$mesText.html(...)` which replaces all children).
+        // now references DETACHED nodes (the rollback re-rendered
+        // the message block, which replaces all children).
         //
         // We MUST invalidate savedRange and close the popup —
         // otherwise the next Save click would run applyRangeEdit
@@ -716,7 +775,7 @@ function onEditSave() {
         // popup open here, which was a critical stuck-state bug.
         savedRange = null;
         currentMesEl = null;
-        hideToolbar();
+        hideToolbar({ restoreFocus: true });
         clearSelection();
         return;
     }
@@ -734,8 +793,16 @@ function onDeleteClick() {
         return;
     }
 
+    if (isStreaming()) {
+        notify("Cannot delete text from a message that is still streaming", "warning");
+        return;
+    }
+
     const previousState = getCurrentMessageState();
-    if (!previousState) return;
+    if (!previousState) {
+        notify("That message is no longer available.", "warning");
+        return;
+    }
 
     const nextMes = resolveRawEdit(savedRange.toString(), "");
     if (nextMes === null) return;
@@ -749,12 +816,12 @@ function onDeleteClick() {
         // pointing into detached DOM, must invalidate.
         savedRange = null;
         currentMesEl = null;
-        hideToolbar();
+        hideToolbar({ restoreFocus: true });
         clearSelection();
         return;
     }
 
-    hideToolbar();
+    hideToolbar({ restoreFocus: true });
     clearSelection();
 }
 
@@ -777,17 +844,53 @@ function getCurrentMessageState() {
 }
 
 /**
+ * Rendered text around the saved selection, for locating it in the
+ * raw source. Takes up to 100 chars each side from the selection's
+ * nearest block element (a <p>, a <div>, or .mes_text itself).
+ * Falls back to empty context when the DOM cannot give it: locateEdit
+ * then behaves like an exact-match search.
+ */
+function getSelectionContext(range) {
+    try {
+        const startEl = normalizeNode(range.startContainer);
+        const blockEl = startEl?.closest("p, div, li, h1, h2, h3, h4, blockquote, pre") || null;
+        if (!blockEl) return { before: "", after: "" };
+        const readRange = (startNode, startOffset, endNode, endOffset) => {
+            const r = document.createRange();
+            r.setStart(startNode, startOffset);
+            r.setEnd(endNode, endOffset);
+            return r.toString();
+        };
+        const before = readRange(blockEl, 0, range.startContainer, range.startOffset).slice(-100);
+        const after = readRange(range.endContainer, range.endOffset, blockEl, blockEl.childNodes.length).slice(0, 100);
+        return { before, after };
+    } catch (e) {
+        return { before: "", after: "" };
+    }
+}
+
+/**
  * Apply the edit to the message's RAW source (`mes`), not the rendered DOM.
  * Returns the new source, or null (with a toast) when the selection can't
- * be located exactly once. See replaceOnce() in util.js.
+ * be located exactly once. See locateEdit() in util.js: the same word can
+ * appear twice in the source (story + hidden <UpdateVariable> block), so
+ * the surrounding rendered text is used to pick the right occurrence.
  */
 function resolveRawEdit(selectedText, newText) {
     const message = getCurrentMessage();
-    const next = message ? replaceOnce(String(message.mes ?? ""), selectedText, newText) : null;
-    if (next === null) {
-        notify("Couldn't match that selection in the message source. Try a slightly longer, plain-text phrase.", "warning");
+    if (!message) return null;
+    const source = String(message.mes ?? "");
+    const context = savedRange ? getSelectionContext(savedRange) : { before: "", after: "" };
+    const loc = locateEdit(source, selectedText, context.before, context.after);
+    if (loc.error === "ambiguous") {
+        notify("That text appears more than once. Select a slightly longer phrase.", "warning");
+        return null;
     }
-    return next;
+    if (loc.error === "notfound") {
+        notify("Couldn't find that text in the message source (formatting?). Select a plainer phrase.", "warning");
+        return null;
+    }
+    return source.slice(0, loc.start) + newText + source.slice(loc.end);
 }
 
 function clearSelection() {
@@ -842,10 +945,14 @@ function positionEditPopup() {
         anchorLeft = vp.left + (vp.width / 2) - (popW / 2);
     }
 
-    let top = vp.top + anchorBottom + gap;
-    let left = vp.left + anchorLeft;
+    // Rect values and position:fixed share layout-viewport coordinates,
+    // so no vp.top/vp.left on the anchor-derived position — it would
+    // double-count under pinch-zoom. vp.* stays in the clamps below
+    // (the visible area, in the same coordinates) and in the sheet pin.
+    let top = anchorBottom + gap;
+    let left = anchorLeft;
 
-    if (top + popH > vp.top + vp.height - 4) top = vp.top + anchorTop - popH - gap;
+    if (top + popH > vp.top + vp.height - 4) top = anchorTop - popH - gap;
     if (top < vp.top + 4) top = vp.top + 4;
     if (left + popW > vp.left + vp.width - 4) left = vp.left + vp.width - popW - 4;
     if (left < vp.left + 4) left = vp.left + 4;
@@ -1006,7 +1113,8 @@ function startListening() {
             return;
         }
 
-        if ((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === "z" && lastDeletedSnapshot) {
+        // Ctrl+Shift+Z is redo, not undo: let it pass through.
+        if ((e.ctrlKey || e.metaKey) && !e.shiftKey && String(e.key).toLowerCase() === "z" && lastDeletedSnapshot) {
             e.preventDefault();
             undoLastDelete();
         }
@@ -1047,7 +1155,7 @@ jQuery(async () => {
     try {
         loadSettings();
         createUI();
-        addMenuItem();
+        tryAddMenuItem();
 
         if (extension_settings[extensionName]?.enabled !== false) {
             startListening();
